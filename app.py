@@ -24,13 +24,23 @@ MACD_MAX_CANDLES = 8
 MACD_COOLDOWN = 180
 MACD_EXECUTOR = ThreadPoolExecutor(max_workers=15)
 
-# BIG MOVE AYARLARI
+# BIG MOVE AYARLARI (LONG)
 BIGMOVE_EXECUTOR = ThreadPoolExecutor(max_workers=20)
 BIGMOVE_COOLDOWN = 600
 BB_SQUEEZE_LOOKBACK = 100
 BB_SQUEEZE_PERCENTILE = 5
 MA200_MIN_BARS_BELOW = 20
 MACD_RESISTANCE_LOOKBACK = 20
+
+# SHORT BIG MOVE AYARLARI
+SHORT_EXECUTOR = ThreadPoolExecutor(max_workers=20)
+SHORT_COOLDOWN = 600
+MA200_MIN_BARS_ABOVE = 20        # MA200 üstünde kaç bar geçirmeli
+RSI_OVERBOUGHT = 70              # RSI aşırı alım eşiği
+RSI_BEARISH_DIV_LOOKBACK = 14   # Bearish divergence için kaç bar bakılacak
+DEATH_CROSS_MA_FAST = 50        # Death cross hızlı MA
+DEATH_CROSS_MA_SLOW = 200       # Death cross yavaş MA
+BB_UPPER_REJECTION_BARS = 3     # BB üst bant reddi için son kaç bar
 
 BINANCE_REST_URLS = [
     "https://fapi.binance.com",
@@ -68,11 +78,17 @@ class MarketRadar:
         self.macd_candidates = {}
         self.macd_last_trigger = {}
 
-        # BIG MOVE state
+        # BIG MOVE LONG state
         self.bigmove_signals = []
         self.bigmove_sent = {}
         self.bigmove_candidates = {}
         self.bigmove_last_trigger = {}
+
+        # BIG MOVE SHORT state
+        self.shortmove_signals = []
+        self.shortmove_sent = {}
+        self.shortmove_candidates = {}
+        self.shortmove_last_trigger = {}
 
     def log(self, msg):
         t = datetime.now().strftime("%H:%M:%S")
@@ -124,6 +140,7 @@ class MarketRadar:
                 self.check_logic(symbol, now)
                 self._maybe_trigger_macd(symbol, price, now)
                 self._maybe_trigger_bigmove(symbol, price, now)
+                self._maybe_trigger_shortmove(symbol, price, now)
 
     def check_logic(self, symbol, now):
         hist = list(self.history[symbol])
@@ -275,7 +292,7 @@ class MarketRadar:
             positive_zone = m_curr > 0 and s_curr > 0
             bullish = m_curr > s_curr
             rising = m_curr > m_prev and s_curr > s_prev
-            histogram = (m_curr - s_curr) >= (m_prev - s_prev) * 0.95
+            histogram = (m_curr - s_curr) >= (m_prev - s_curr) * 0.95
             m_slope = m_curr - m_prev
             s_slope = s_curr - s_prev
             parallel = False
@@ -349,7 +366,7 @@ class MarketRadar:
             self.log(f"🔷 MACD SİNYAL: {sym_clean} {macd_tag}")
 
     # ================================================================
-    # BIG MOVE HUNTER
+    # BIG MOVE HUNTER (LONG)
     # ================================================================
 
     def _maybe_trigger_bigmove(self, symbol, price, now):
@@ -542,6 +559,320 @@ class MarketRadar:
             if len(self.bigmove_signals) > MAX_DISPLAY_ROWS:
                 self.bigmove_signals.pop()
 
+    # ================================================================
+    # SHORT BIG MOVE HUNTER
+    # Kriterler:
+    #   1. MA200 Breakdown  — fiyat 20+ bar MA200 üstündeyken altına kırılıyor (long'un tersi)
+    #   2. Death Cross      — 4H'ta 50MA, 200MA'nın altına geçiyor
+    #   3. RSI Overbought + Bearish Divergence — 1H RSI>70 + fiyat yüksek ama RSI düşüyor
+    #   4. BB Upper Rejection — BB sıkışması sonrası üst banttan reddediliyor
+    #   5. MACD Bearish Crossover — 1H MACD sinyal çizgisinin altına geçiyor, histogram negatife dönüyor
+    # ================================================================
+
+    def _maybe_trigger_shortmove(self, symbol, price, now):
+        hist = list(self.history.get(symbol, []))
+        if len(hist) < 6:
+            return
+        last_t = self.shortmove_last_trigger.get(symbol, 0)
+        if now - last_t < 45:
+            return
+        past_1m = next((x for x in reversed(hist) if now - x[0] >= 60), hist[0])
+        p_chg_1m = ((price - past_1m[1]) / past_1m[1]) * 100
+        # Short için fiyat düşüyor olmalı (negatif değişim)
+        if p_chg_1m <= -0.35:
+            self.shortmove_last_trigger[symbol] = now
+            SHORT_EXECUTOR.submit(self._run_shortmove_analysis, symbol, price)
+
+    def _ma200_breakdown_analysis(self, df: pd.DataFrame) -> tuple:
+        """Fiyat MA200'ün altına kırılıyor mu? (Long'daki breakout'un tersi)"""
+        if len(df) < 250:
+            return False, 0, 0.0, 0.0
+
+        df['ma200'] = df['close'].rolling(window=200).mean()
+        closes = df['close'].values
+        ma200 = df['ma200'].values
+
+        # Son bar MA200 altında olmalı
+        if closes[-1] >= ma200[-1]:
+            return False, 0, ma200[-1], 0.0
+
+        # Bir önceki bar MA200 üstünde olmalı (yeni kırılma)
+        if closes[-2] <= ma200[-2]:
+            return False, 0, ma200[-1], 0.0
+
+        # Kırılmadan önce kaç bar MA200 üstündeydi?
+        bars_above = 0
+        for i in range(2, min(len(closes), 300)):
+            if not np.isnan(ma200[-i]) and closes[-i] > ma200[-i]:
+                bars_above += 1
+            else:
+                break
+
+        if bars_above < MA200_MIN_BARS_ABOVE:
+            return False, bars_above, ma200[-1], 0.0
+
+        # MA200'den ne kadar aşağıda?
+        distance_pct = ((closes[-1] - ma200[-1]) / ma200[-1]) * 100  # negatif değer
+        return True, bars_above, ma200[-1], distance_pct
+
+    def _death_cross_analysis(self, df: pd.DataFrame) -> tuple:
+        """4H Death Cross: 50MA, 200MA'nın altına geçiyor mu?"""
+        if len(df) < 210:
+            return False, 0.0, 0.0
+
+        df['ma50'] = df['close'].rolling(window=50).mean()
+        df['ma200'] = df['close'].rolling(window=200).mean()
+
+        ma50 = df['ma50'].values
+        ma200 = df['ma200'].values
+
+        if np.isnan(ma50[-1]) or np.isnan(ma200[-1]):
+            return False, 0.0, 0.0
+
+        # Yeni death cross: önceki bar ma50 > ma200, şimdi ma50 < ma200
+        if ma50[-1] >= ma200[-1]:
+            return False, ma50[-1], ma200[-1]
+
+        if ma50[-2] <= ma200[-2]:
+            return False, ma50[-1], ma200[-1]
+
+        return True, ma50[-1], ma200[-1]
+
+    def _rsi_overbought_bearish_div(self, closes: pd.Series) -> tuple:
+        """
+        1H RSI analizi:
+        - RSI > 70 (overbought) VE
+        - Bearish divergence: fiyat yeni yüksek yaparken RSI düşüyor
+        Dönen: (is_signal, rsi_now, is_overbought, is_bearish_div)
+        """
+        if len(closes) < RSI_BEARISH_DIV_LOOKBACK + 5:
+            return False, 0.0, False, False
+
+        delta = closes.diff()
+        gain = delta.clip(lower=0)
+        loss = (-delta).clip(lower=0)
+        avg_gain = gain.ewm(com=13, adjust=False).mean()
+        avg_loss = loss.ewm(com=13, adjust=False).mean()
+        rs = avg_gain / avg_loss.replace(0, np.nan)
+        rsi = 100 - (100 / (1 + rs))
+
+        rsi_now = rsi.iloc[-1]
+        is_overbought = rsi_now > RSI_OVERBOUGHT
+
+        # Bearish divergence: son 14 bar içinde fiyat yüksek ama RSI daha düşük
+        lookback = RSI_BEARISH_DIV_LOOKBACK
+        price_high_recent = closes.iloc[-1]
+        price_high_prev = closes.iloc[-lookback:-1].max()
+        rsi_at_recent = rsi.iloc[-1]
+        rsi_at_prev_high_idx = closes.iloc[-lookback:-1].idxmax()
+        rsi_at_prev_high = rsi.loc[rsi_at_prev_high_idx] if rsi_at_prev_high_idx in rsi.index else rsi.iloc[-lookback]
+
+        # Fiyat yeni yüksek yaptı ama RSI yapmadı
+        is_bearish_div = (price_high_recent > price_high_prev) and (rsi_at_recent < rsi_at_prev_high - 2)
+
+        is_signal = is_overbought or is_bearish_div
+        return is_signal, round(float(rsi_now), 1), is_overbought, is_bearish_div
+
+    def _bb_upper_rejection(self, df: pd.DataFrame) -> tuple:
+        """
+        BB üst bantından fiyat reddediliyor mu?
+        - BB squeeze sonrası üst banda temas
+        - Son barlarda fiyat üst bandın altına dönüyor (red mum)
+        """
+        if len(df) < 30:
+            return False, 0.0
+
+        df['sma20'] = df['close'].rolling(window=20).mean()
+        df['std20'] = df['close'].rolling(window=20).std()
+        df['upper'] = df['sma20'] + (df['std20'] * 2)
+        df['lower'] = df['sma20'] - (df['std20'] * 2)
+        df['bandwidth'] = (df['upper'] - df['lower']) / df['sma20'] * 100
+
+        recent_bw = df['bandwidth'].iloc[-50:].dropna()
+        if len(recent_bw) < 10:
+            return False, 0.0
+
+        # Son fiyat ve üst bant
+        last_close = df['close'].iloc[-1]
+        last_open = df['open'].iloc[-1]
+        last_upper = df['upper'].iloc[-1]
+        last_high = df['high'].iloc[-1]
+
+        # Son BB pozisyonu (1.0 = üst bant, 0.0 = alt bant)
+        bb_range = df['upper'].iloc[-1] - df['lower'].iloc[-1]
+        bb_pos = (last_close - df['lower'].iloc[-1]) / bb_range if bb_range > 0 else 0.5
+
+        # Üst banttan red: son 3 bar içinde herhangi biri üst bandı test etti mi?
+        touched_upper = False
+        for i in range(1, BB_UPPER_REJECTION_BARS + 1):
+            if len(df) >= i:
+                if df['high'].iloc[-i] >= df['upper'].iloc[-i] * 0.99:
+                    touched_upper = True
+                    break
+
+        # Şu an fiyat üst bandın altında ve düşüyor (bearish mum)
+        bearish_candle = last_close < last_open
+        below_upper = last_close < last_upper
+
+        is_rejection = touched_upper and bearish_candle and below_upper and bb_pos > 0.7
+
+        return is_rejection, round(bb_pos, 2)
+
+    def _macd_bearish_crossover(self, closes: pd.Series) -> tuple:
+        """
+        1H MACD bearish crossover:
+        - MACD çizgisi sinyal çizgisinin altına geçiyor
+        - Histogram negatife dönüyor veya negatif histogram büyüyor
+        """
+        if len(closes) < 40:
+            return False, 0.0, 0.0, 0.0
+
+        exp1 = closes.ewm(span=12, adjust=False).mean()
+        exp2 = closes.ewm(span=26, adjust=False).mean()
+        macd_line = exp1 - exp2
+        signal_line = macd_line.ewm(span=9, adjust=False).mean()
+        histogram = macd_line - signal_line
+
+        m_now = macd_line.iloc[-1]
+        s_now = signal_line.iloc[-1]
+        h_now = histogram.iloc[-1]
+        m_prev = macd_line.iloc[-2]
+        s_prev = signal_line.iloc[-2]
+        h_prev = histogram.iloc[-2]
+
+        # Bearish crossover: MACD sinyal çizgisinin altına geçiyor
+        fresh_bearish_cross = (m_prev >= s_prev) and (m_now < s_now)
+
+        # Histogram negatife dönüyor
+        hist_turning_negative = h_prev >= 0 and h_now < 0
+
+        # Zaten negatif bölgede ama histogram daha da büyüyor (güçlü satış baskısı)
+        hist_expanding_negative = h_now < 0 and h_now < h_prev and m_now < 0
+
+        is_bearish = fresh_bearish_cross or hist_turning_negative or hist_expanding_negative
+
+        return is_bearish, round(float(m_now), 4), round(float(s_now), 4), round(float(h_now), 4)
+
+    def _run_shortmove_analysis(self, symbol, price):
+        sym_clean = symbol.replace("USDT", "")
+        now = time.time()
+
+        with self.lock:
+            if now - self.shortmove_sent.get(sym_clean, 0) < SHORT_COOLDOWN:
+                return
+
+        # Veri çekimi
+        df_4h = self._fetch_klines_ohlc(symbol, "4h", 300)
+        df_4h_short = self._fetch_klines_ohlc(symbol, "4h", 60)  # BB rejection için
+        closes_1h = self._fetch_klines(symbol, "1h", 100)
+        df_1h = self._fetch_klines_ohlc(symbol, "1h", 60)
+
+        if df_4h is None or closes_1h is None:
+            return
+
+        # 5 SHORT KRİTERİ ANALİZİ
+        # 1. MA200 Breakdown (4H)
+        ma200_break, bars_above, ma200_val, dist_pct = self._ma200_breakdown_analysis(df_4h)
+
+        # 2. Death Cross (4H)
+        death_cross, ma50_val, ma200_dc_val = self._death_cross_analysis(df_4h)
+
+        # 3. RSI Overbought + Bearish Divergence (1H)
+        rsi_signal, rsi_now, is_overbought, is_bearish_div = self._rsi_overbought_bearish_div(closes_1h)
+
+        # 4. BB Upper Rejection (4H)
+        bb_rejection, bb_pos = self._bb_upper_rejection(df_4h_short if df_4h_short is not None else df_4h)
+
+        # 5. MACD Bearish Crossover (1H)
+        macd_bearish, macd_m, macd_s, macd_h = self._macd_bearish_crossover(closes_1h)
+
+        # SKORLAMA
+        conditions_met = []
+        total_score = 0
+
+        if ma200_break:
+            conditions_met.append(f"MA200-Down({bars_above})")
+            total_score += 35
+            if bars_above > 50:
+                total_score += 10
+
+        if death_cross:
+            conditions_met.append("Death-Cross")
+            total_score += 30
+
+        if rsi_signal:
+            if is_overbought and is_bearish_div:
+                conditions_met.append(f"RSI-OB+Div({rsi_now})")
+                total_score += 30
+            elif is_overbought:
+                conditions_met.append(f"RSI-OB({rsi_now})")
+                total_score += 15
+            elif is_bearish_div:
+                conditions_met.append(f"RSI-BearDiv({rsi_now})")
+                total_score += 20
+
+        if bb_rejection:
+            conditions_met.append(f"BB-Reject({bb_pos})")
+            total_score += 20
+
+        if macd_bearish:
+            conditions_met.append("MACD-Bear")
+            total_score += 25
+
+        if not conditions_met:
+            return
+
+        # En az 2 koşul veya MA200 breakdown tek başına yeterli
+        if len(conditions_met) < 2 and not ma200_break:
+            return
+
+        if total_score < 50:
+            return
+
+        t_str = datetime.now().strftime("%H:%M:%S")
+
+        # Sadece BB sıkışma varsa (henüz breakout yok) → radar listesine ekle
+        if bb_rejection and not ma200_break and not death_cross and len(conditions_met) == 1:
+            with self.lock:
+                self.shortmove_candidates[sym_clean] = {
+                    "Time": t_str,
+                    "Symbol": sym_clean,
+                    "Price": f"{price:.4f}" if price < 1 else f"{price:.2f}",
+                    "Score": total_score,
+                    "Conditions": ", ".join(conditions_met),
+                    "Status": "Short Radar",
+                    "BB_Pos": f"{bb_pos:.2f}",
+                    "RSI": str(rsi_now),
+                }
+            self.log(f"🔴 SHORT RADAR: {sym_clean} BB-Reject BB-pos:{bb_pos:.2f} RSI:{rsi_now}")
+            return
+
+        # Sinyal üret
+        with self.lock:
+            if now - self.shortmove_sent.get(sym_clean, 0) < SHORT_COOLDOWN:
+                return
+            self.shortmove_sent[sym_clean] = now
+
+            for s in self.shortmove_signals[:5]:
+                if s.get('Symbol') == sym_clean:
+                    return
+
+            self.shortmove_signals.insert(0, {
+                "Time": t_str,
+                "Symbol": sym_clean,
+                "Price": f"{price:.4f}" if price < 1 else f"{price:.2f}",
+                "Score": total_score,
+                "Conditions": ", ".join(conditions_met),
+                "Status": "SHORT MOVE",
+                "BB_Pos": f"{bb_pos:.2f}",
+                "MA200_Dist": f"{dist_pct:.2f}%" if ma200_break else "—",
+                "RSI": str(rsi_now),
+                "MACD_1H": f"H:{macd_h:.3f}" if macd_bearish else "—",
+            })
+            self.log(f"🔻🔻🔻 SHORT MOVE SİNYAL: {sym_clean} | {' | '.join(conditions_met)} | Score:{total_score}")
+            if len(self.shortmove_signals) > MAX_DISPLAY_ROWS:
+                self.shortmove_signals.pop()
+
 
 # ==================== WORKER ====================
 @st.cache_resource
@@ -569,7 +900,8 @@ def binance_worker(radar_obj):
                         f"✅ Fetch #{fetch_count} | Pairs: {radar_obj.total_pairs} | "
                         f"Signals: {len(radar_obj.signals)} | "
                         f"MACD Radar: {len(radar_obj.macd_candidates)} | "
-                        f"BigMove: {len(radar_obj.bigmove_signals)}"
+                        f"BigMove: {len(radar_obj.bigmove_signals)} | "
+                        f"ShortMove: {len(radar_obj.shortmove_signals)}"
                     )
             else:
                 radar_obj.log(f"⚠️ HTTP {r.status_code}")
@@ -594,8 +926,10 @@ st.markdown("""
     .mode-flash { background-color: #e67e22; color: #fff; padding: 2px 8px; border-radius: 4px; font-weight: bold; }
     .mode-macd  { background-color: #8e44ad; color: #fff; padding: 2px 8px; border-radius: 4px; font-weight: bold; }
     .mode-bigmove { background-color: #f39c12; color: #000; padding: 2px 8px; border-radius: 4px; font-weight: bold; }
+    .mode-shortmove { background-color: #c0392b; color: #fff; padding: 2px 8px; border-radius: 4px; font-weight: bold; }
     .macd-tag   { background-color: #2c1654; color: #c39bd3; padding: 2px 7px; border-radius: 4px; font-size: 0.78rem; font-weight: bold; border: 1px solid #8e44ad; }
     .bigmove-tag { background-color: #3d2208; color: #f5b041; padding: 2px 7px; border-radius: 4px; font-size: 0.78rem; font-weight: bold; border: 1px solid #f39c12; }
+    .shortmove-tag { background-color: #3d0808; color: #ff7675; padding: 2px 7px; border-radius: 4px; font-size: 0.78rem; font-weight: bold; border: 1px solid #c0392b; }
     .stat-card { background-color: #1e2127; padding: 10px; border-radius: 10px; margin-bottom: 10px; border-left: 5px solid #f1c40f; }
     .debug-box { background-color: #1a1a2e; border: 1px solid #333; border-radius: 8px; padding: 10px; font-family: monospace; font-size: 0.75rem; color: #aaa; max-height: 200px; overflow-y: auto; }
     table { width: 100%; border-collapse: collapse; }
@@ -610,6 +944,7 @@ st.markdown("""
     .row-conf-dump  { background-color: rgba(255, 75,  75,  0.08) !important; }
     .row-macd       { background-color: rgba(142, 68, 173, 0.12) !important; border-left: 3px solid #8e44ad !important; }
     .row-bigmove    { background-color: rgba(243, 156, 18, 0.15) !important; border-left: 4px solid #f39c12 !important; }
+    .row-shortmove  { background-color: rgba(192, 57, 43, 0.18) !important; border-left: 4px solid #c0392b !important; }
     .macd-radar-card { background: #1a1030; border: 1px solid #8e44ad; border-radius: 8px; padding: 8px 12px; margin-bottom: 6px; }
     .macd-radar-sym { color: #c39bd3; font-weight: bold; font-size: 1rem; }
     .macd-radar-tag { color: #f0c3ff; font-size: 0.82rem; }
@@ -622,6 +957,12 @@ st.markdown("""
     .bigmove-radar-card { background: #1a1508; border: 1px solid #7f8c8d; border-radius: 8px; padding: 8px 12px; margin-bottom: 6px; }
     .bigmove-radar-sym { color: #d5dbdb; font-weight: bold; font-size: 1rem; }
     .bigmove-radar-cond { color: #aab7b8; font-size: 0.82rem; }
+    .shortmove-card { background: #1f0a0a; border: 1px solid #c0392b; border-radius: 8px; padding: 10px 14px; margin-bottom: 8px; }
+    .shortmove-sym { color: #ff7675; font-weight: bold; font-size: 1.1rem; }
+    .shortmove-cond { color: #fab1a0; font-size: 0.85rem; }
+    .shortmove-radar-card { background: #1a0a08; border: 1px solid #7f3030; border-radius: 8px; padding: 8px 12px; margin-bottom: 6px; }
+    .shortmove-radar-sym { color: #e17055; font-weight: bold; font-size: 1rem; }
+    .shortmove-radar-cond { color: #d63031; font-size: 0.82rem; }
     </style>
 """, unsafe_allow_html=True)
 
@@ -636,14 +977,14 @@ if "thread_started" not in st.session_state:
 st.sidebar.title("Navigation")
 page = st.sidebar.radio(
     "Sayfa Sec",
-    ["📡 Normal Sinyaller", "🎯 Big Move Hunter"],
+    ["📡 Normal Sinyaller", "🚀 Long Big Move Hunter", "🔻 Short Big Move Hunter"],
     index=0,
 )
 st.sidebar.markdown("---")
-st.sidebar.caption("v2.0 | Market Radar Pro")
+st.sidebar.caption("v3.0 | Market Radar Pro")
 
 # Header ortak
-h1, h2, h3, h4 = st.columns([2, 1, 1, 1])
+h1, h2, h3, h4, h5 = st.columns([2, 1, 1, 1, 1])
 h1.title("📡 Market Radar Pro")
 
 elapsed = time.time() - radar.last_heartbeat
@@ -659,7 +1000,8 @@ h2.markdown(
 )
 h3.metric("Pairs Tracked", radar.total_pairs)
 h3.metric("Total Signals", len(radar.signals))
-h4.metric("Big Moves", len(radar.bigmove_signals))
+h4.metric("Long Big Moves", len(radar.bigmove_signals))
+h5.metric("Short Big Moves", len(radar.shortmove_signals))
 
 st.divider()
 
@@ -842,14 +1184,14 @@ if page == "📡 Normal Sinyaller":
         time.sleep(1.5)
 
 # ================================================================
-# SAYFA 2: BIG MOVE HUNTER
+# SAYFA 2: LONG BIG MOVE HUNTER
 # ================================================================
-else:
-    h1.caption("🎯 Bollinger Squeeze + 4H MA200 Break + 1H MACD Resistance Break")
+elif page == "🚀 Long Big Move Hunter":
+    st.caption("🎯 Bollinger Squeeze + 4H MA200 Break + 1H MACD Resistance Break")
 
     st.markdown("""
     <div style="background-color:#1a1508; border-left:4px solid #f39c12; padding:12px 16px; border-radius:4px; margin-bottom:16px;">
-        <b style="color:#f5b041;">Big Move Hunter Nasıl Çalışır?</b><br>
+        <b style="color:#f5b041;">Long Big Move Hunter Nasıl Çalışır?</b><br>
         <span style="color:#d5dbdb; font-size:0.9rem;">
         1. <b>BB Squeeze:</b> 4H Bollinger Bantları geçmiş 100 mumun en dar %5'lik diliminde mi?<br>
         2. <b>MA200 Break:</b> 4H fiyat 20+ mum (5 gün) MA200 altında kaldıktan sonra üzerine atıyor mu?<br>
@@ -869,7 +1211,7 @@ else:
     col_bm_main, col_bm_radar = st.columns([3, 1])
 
     with col_bm_main:
-        st.subheader("🚀 Big Move Sinyalleri")
+        st.subheader("🚀 Long Big Move Sinyalleri")
         bm_main_placeholder = st.empty()
 
     with col_bm_radar:
@@ -905,7 +1247,7 @@ else:
                     html += "</table>"
                     st.markdown(html, unsafe_allow_html=True)
                 else:
-                    st.info("Big Move sinyali bekleniyor... Piyasa taranıyor 🔭")
+                    st.info("Long Big Move sinyali bekleniyor... Piyasa taranıyor 🔭")
 
     while True:
         with radar.lock:
@@ -942,5 +1284,117 @@ else:
                     </div>""", unsafe_allow_html=True)
             else:
                 st.caption("Squeeze taraniyor...")
+
+        time.sleep(2)
+
+# ================================================================
+# SAYFA 3: SHORT BIG MOVE HUNTER
+# ================================================================
+else:
+    st.caption("🔻 MA200 Breakdown + Death Cross + RSI Bearish Div + BB Upper Rejection + MACD Bear")
+
+    st.markdown("""
+    <div style="background-color:#1f0a0a; border-left:4px solid #c0392b; padding:12px 16px; border-radius:4px; margin-bottom:16px;">
+        <b style="color:#ff7675;">Short Big Move Hunter Nasıl Çalışır?</b><br>
+        <span style="color:#d5dbdb; font-size:0.9rem;">
+        1. <b>MA200 Breakdown:</b> 4H fiyat 20+ mum MA200 üstünde kaldıktan sonra altına kırılıyor mu? (35 puan, tek başına yeterli)<br>
+        2. <b>Death Cross:</b> 4H 50MA, 200MA'nın altına geçiyor mu? (30 puan)<br>
+        3. <b>RSI Overbought + Bearish Divergence:</b> 1H RSI &gt;70 VE/VEYA fiyat yüksek ama RSI düşüyor (15–30 puan)<br>
+        4. <b>BB Upper Rejection:</b> 4H Bollinger üst bantından fiyat reddediliyor, bearish mum oluşuyor (20 puan)<br>
+        5. <b>MACD 1H Bearish:</b> 1H MACD sinyal çizgisinin altına geçiyor, histogram negatife dönüyor (25 puan)<br>
+        <br>
+        <b>Sinyal için:</b> En az 2 koşul birleşmeli + toplam skor ≥ 50. MA200 Breakdown tek başına yeterlidir.
+        </span>
+    </div>
+    """, unsafe_allow_html=True)
+
+    col_f1, col_f2, col_f3 = st.columns([1, 1, 1])
+    sm_search = col_f1.text_input("🔍 Symbol Ara", placeholder="BTC...", key="sm_search").upper()
+    sm_min_score = col_f2.slider("Min Skor", 0, 100, 50, key="sm_score")
+    sm_show_radar = col_f3.checkbox("Sadece Short Radar (henüz breakout olmamış)", value=False)
+
+    st.divider()
+
+    col_sm_main, col_sm_radar = st.columns([3, 1])
+
+    with col_sm_main:
+        st.subheader("🔻 Short Big Move Sinyalleri")
+        sm_main_placeholder = st.empty()
+
+    with col_sm_radar:
+        st.subheader("👁 Short Radar")
+        sm_radar_placeholder = st.empty()
+
+    def render_shortmove_table(data, placeholder):
+        with placeholder.container():
+            if data:
+                html = (
+                    "<table><tr>"
+                    "<th>Time</th><th>Symbol</th><th>Price</th>"
+                    "<th>Skor</th><th>Kosullar</th><th>MA200 Mesafe</th><th>RSI</th><th>MACD 1H</th>"
+                    "</tr>"
+                )
+                for row in data:
+                    sym = row['Symbol']
+                    tv_url = f"https://www.tradingview.com/chart/?symbol=BINANCE:{sym}USDT.P"
+                    score_color = "#ff4b4b" if row['Score'] >= 70 else "#e17055" if row['Score'] >= 50 else "#e74c3c"
+
+                    html += (
+                        f"<tr class='row-shortmove'>"
+                        f"<td>{row['Time']}</td>"
+                        f"<td><a href='{tv_url}' target='_blank' class='sym-link'>{sym}</a></td>"
+                        f"<td>{row['Price']}</td>"
+                        f"<td style='color:{score_color}; font-weight:bold; font-size:1.1rem;'>{row['Score']}</td>"
+                        f"<td><span class='shortmove-tag'>{row['Conditions']}</span></td>"
+                        f"<td style='color:#ff7675;'>{row['MA200_Dist']}</td>"
+                        f"<td style='color:#fab1a0;'>{row['RSI']}</td>"
+                        f"<td>{row['MACD_1H']}</td>"
+                        f"</tr>"
+                    )
+                html += "</table>"
+                st.markdown(html, unsafe_allow_html=True)
+            else:
+                st.info("Short Big Move sinyali bekleniyor... Düşüş fırsatları taranıyor 🔍")
+
+    while True:
+        with radar.lock:
+            sm_signals = list(radar.shortmove_signals)
+            sm_candidates = dict(radar.shortmove_candidates)
+
+        display_sm = sm_signals
+        if sm_search:
+            display_sm = [s for s in display_sm if sm_search in s['Symbol']]
+        display_sm = [s for s in display_sm if s['Score'] >= sm_min_score]
+
+        if sm_show_radar:
+            display_sm = []
+
+        render_shortmove_table(display_sm, sm_main_placeholder)
+
+        with sm_radar_placeholder.container():
+            sm_radar_items = []
+            if sm_candidates:
+                for sym, info in sm_candidates.items():
+                    if sm_search and sm_search not in sym:
+                        continue
+                    sm_radar_items.append((sym, info))
+
+            sm_radar_items.sort(key=lambda x: x[1].get('Score', 0), reverse=True)
+
+            if sm_radar_items:
+                for sym, info in sm_radar_items[:15]:
+                    tv_url = f"https://www.tradingview.com/chart/?symbol=BINANCE:{sym}USDT.P"
+                    st.markdown(f"""<div class="shortmove-radar-card">
+                        <a href="{tv_url}" target="_blank" class="shortmove-radar-sym">{sym}</a><br>
+                        <span class="shortmove-radar-cond">{info["Conditions"]}</span><br>
+                        <span style="color:#888; font-size:0.8rem;">
+                            Skor: <b>{info["Score"]}</b> | 
+                            BB-Poz: {info.get("BB_Pos","—")} | 
+                            RSI: {info.get("RSI","—")} | 
+                            {info["Time"]}
+                        </span>
+                    </div>""", unsafe_allow_html=True)
+            else:
+                st.caption("Short fırsatları taraniyor...")
 
         time.sleep(2)

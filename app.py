@@ -834,7 +834,7 @@ if page == "📡 Normal Sinyaller":
                         <span class="macd-radar-tag">{info["MACD Pattern"]}</span>
                         &nbsp;
                         <span style="color:#aaa;font-size:0.8rem">{info["Fiyat"]}</span><br>
-                        <span class="macd-radar-time">{info["Guncelleme"]}</span>
+                   <span class="macd-radar-time">{info.get("Guncelleme", "N/A")}</span>
                     </div>""", unsafe_allow_html=True)
             else:
                 st.caption("MACD taraniyor...")

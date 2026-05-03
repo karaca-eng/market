@@ -22,7 +22,7 @@ PUMP_DUMP_THRESHOLD = 1.5
 
 # MACD Paralel Yükselme Ayarları
 MACD_MIN_CANDLES = 3   # Sinyal için minimum ardışık mum
-MACD_MAX_CANDLES = 9   # Sinyal için maksimum ardışık mum (üstü zaten güçlü trend, giriş geç)
+MACD_MAX_CANDLES = 8   # Sinyal için maksimum ardışık mum (üstü zaten güçlü trend, giriş geç)
 MACD_COOLDOWN = 180    # Aynı sembol için minimum sinyal aralığı (sn)
 MACD_EXECUTOR = ThreadPoolExecutor(max_workers=15)
 
@@ -201,7 +201,7 @@ class MarketRadar:
                 self.signals.pop()
 
     # ================================================================
-    # MACD PARALEL YÜKSELİŞ — V14'ten uyarlandı
+    # MACD PARALEL YÜKSELİŞ — GÜNCELLENMİŞ VERSİYON
     # ================================================================
 
     def _maybe_trigger_macd(self, symbol, price, now):
@@ -243,11 +243,14 @@ class MarketRadar:
     def _analyze_macd_window(self, closes: pd.Series) -> int:
         """
         Ardışık kaç mumda MACD 'sağlıklı paralel yükseliş' içinde?
-        Koşullar (V14 ile aynı):
-          1. macd > 0 ve sinyal > 0
-          2. macd > sinyal
+        
+        Koşullar:
+          1. macd > 0 ve sinyal > 0          (Pozitif bölge — 0 üzerinde)
+          2. macd > sinyal                   (Histogram pozitif)
           3. Her ikisi de bir önceki muma göre yükseliyor
-          4. Histogram genişlemesi: fark >= önceki fark * 0.97
+          4. Histogram daralması en fazla %5  (0.95 çarpanı — trendi kırmayacak kadar esnek)
+          5. PARALELLIK: MACD eğimi / Signal eğimi 0.4 ile 2.5 arasında.
+             Böylece iki çizgi birbirine paralel, aşırı ayrışma yok.
         """
         exp1 = closes.ewm(span=12, adjust=False).mean()
         exp2 = closes.ewm(span=26, adjust=False).mean()
@@ -263,13 +266,28 @@ class MarketRadar:
             s_curr = signal_line.iloc[-i]
             s_prev = signal_line.iloc[-(i + 1)]
 
-            healthy = (
-                m_curr > 0 and s_curr > 0 and
-                m_curr > s_curr and
-                m_curr > m_prev and s_curr > s_prev and
-                (m_curr - s_curr) >= (m_prev - s_prev) * 0.97
-            )
-            if healthy:
+            # 1. Pozitif bölge (0 üzerinde)
+            positive_zone = m_curr > 0 and s_curr > 0
+
+            # 2. MACD sinyalin üzerinde
+            bullish = m_curr > s_curr
+
+            # 3. Her ikisi de yükseliyor
+            rising = m_curr > m_prev and s_curr > s_prev
+
+            # 4. Histogram daralma kontrolü (en fazla %5 daralma tolere edilir)
+            histogram = (m_curr - s_curr) >= (m_prev - s_prev) * 0.95
+
+            # 5. PARALELLIK: Eğim oranı kontrolü
+            m_slope = m_curr - m_prev
+            s_slope = s_curr - s_prev
+            if s_slope > 0:
+                ratio = m_slope / s_slope
+                parallel = 0.4 <= ratio <= 2.5
+            else:
+                parallel = False
+
+            if positive_zone and bullish and rising and histogram and parallel:
                 count += 1
             else:
                 break
@@ -280,7 +298,7 @@ class MarketRadar:
         Thread pool'da çalışır.
         MACD sayısına göre:
           - Her sayı >= 1: radar_candidates güncellenir
-          - 3 <= sayı <= 9: mevcut sinyallere MACD etiketi eklenir
+          - 3 <= sayı <= 8: mevcut sinyallere MACD etiketi eklenir
             veya standalone MACD sinyali eklenir
         """
         closes = self._fetch_klines_macd(symbol)
@@ -304,7 +322,7 @@ class MarketRadar:
                 self.macd_candidates.pop(sym_clean, None)
             return
 
-        # Sinyal eşiği: 3-9 mum arası
+        # Sinyal eşiği: 3-8 mum arası
         if not (MACD_MIN_CANDLES <= macd_count <= MACD_MAX_CANDLES):
             return
 
@@ -429,7 +447,7 @@ if "thread_started" not in st.session_state:
 # Header
 h1, h2, h3, h4 = st.columns([2, 1, 1, 1])
 h1.title("📡 Market Radar")
-h1.caption("⚡ Flash: Anlık hareket | 💎 Confirmed: 3dk+15dk | 📊 MACD: Paralel yükseliş (3-9 mum)")
+h1.caption("⚡ Flash: Anlık hareket | 💎 Confirmed: 3dk+15dk | 📊 MACD: Paralel yükseliş (3-8 mum)")
 
 elapsed = time.time() - radar.last_heartbeat
 status_html = (

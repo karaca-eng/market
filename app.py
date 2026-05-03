@@ -15,7 +15,7 @@ CONFIRM_CHG_15M = 1.0
 FAST_STRIKE_CHG = 0.5
 TRI_WINDOW = 180
 MAX_DISPLAY_ROWS = 100
-FETCH_INTERVAL = 3
+FETCH_INTERVAL = 10  # 3'ten 10'a çıkarıldı - 418 fix
 
 PUMP_DUMP_THRESHOLD = 1.5
 
@@ -24,7 +24,6 @@ BINANCE_REST_URLS = [
     "https://fapi1.binance.com",
     "https://fapi2.binance.com",
 ]
-
 
 # ==================== HELPERS ====================
 def get_signal_label(direction: str, chg: float) -> str:
@@ -45,10 +44,20 @@ class MarketRadar:
         self.total_pairs = 0
         self.last_reset_hour = datetime.now().hour
         self.last_reset_4h_block = datetime.now().hour // 4
-        self.headers = {'User-Agent': 'Mozilla/5.0'}
+        # Gelişmiş headers - 418 bot korumasını aşmak için
+        self.headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+            'Accept': 'application/json, text/plain, */*',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'Cache-Control': 'no-cache',
+            'Pragma': 'no-cache',
+            'Connection': 'keep-alive',
+        }
         self.rest_base_url = BINANCE_REST_URLS[0]
         self.price_cache_15m = {}
-        self.debug_log = []  # debug mesajları buraya
+        self.debug_log = []
+        self.url_index = 0  # URL rotation için
 
     def log(self, msg):
         t = datetime.now().strftime("%H:%M:%S")
@@ -62,7 +71,11 @@ class MarketRadar:
     def get_working_rest_url(self):
         for url in BINANCE_REST_URLS:
             try:
-                r = requests.get(f"{url}/fapi/v1/ping", timeout=3)
+                r = requests.get(
+                    f"{url}/fapi/v1/ping",
+                    headers=self.headers,
+                    timeout=5
+                )
                 if r.status_code == 200:
                     self.rest_base_url = url
                     self.log(f"✅ Binance bağlantısı OK: {url}")
@@ -73,6 +86,12 @@ class MarketRadar:
                 self.log(f"❌ {url} → HATA: {e}")
         self.log("🔴 Hiçbir Binance URL'e bağlanılamadı!")
         return self.rest_base_url
+
+    def rotate_url(self):
+        """Bir sonraki URL'e geç"""
+        self.url_index = (self.url_index + 1) % len(BINANCE_REST_URLS)
+        self.rest_base_url = BINANCE_REST_URLS[self.url_index]
+        self.log(f"🔄 URL değiştirildi → {self.rest_base_url}")
 
     def check_resets(self):
         now = datetime.now()
@@ -137,7 +156,7 @@ class MarketRadar:
                 return price
         try:
             url = f"{self.rest_base_url}/fapi/v1/klines?symbol={symbol}&interval=15m&limit=2"
-            response = requests.get(url, headers=self.headers, timeout=2)
+            response = requests.get(url, headers=self.headers, timeout=3)
             if response.status_code == 200:
                 price = float(response.json()[0][1])
                 self.price_cache_15m[symbol] = (now, price)
@@ -191,26 +210,58 @@ def get_radar_instance():
 
 def binance_worker(radar_obj):
     radar_obj.log(">>> WORKER THREAD BAŞLADI")
-    working_url = radar_obj.get_working_rest_url()
-    radar_obj.log(f">>> Kullanılan URL: {working_url}")
-    
+    radar_obj.get_working_rest_url()
+
     fetch_count = 0
+    retry_delay = FETCH_INTERVAL  # başlangıç bekleme süresi
+
     while True:
         try:
             url = f"{radar_obj.rest_base_url}/fapi/v1/ticker/24hr"
-            r = requests.get(url, timeout=5)
+            r = requests.get(url, headers=radar_obj.headers, timeout=8)
             fetch_count += 1
+
+            # 418 veya 429 → rate limit / bot koruması
+            if r.status_code in (418, 429):
+                retry_delay = min(retry_delay * 2, 120)  # max 2 dakika bekle
+                radar_obj.log(
+                    f"🚫 Rate limit / Bot koruması ({r.status_code}) "
+                    f"→ {retry_delay}s bekleniyor, URL değiştiriliyor..."
+                )
+                radar_obj.rotate_url()
+                time.sleep(retry_delay)
+                continue
+
+            # Başarılıysa delay'i sıfırla
             if r.status_code == 200:
+                retry_delay = FETCH_INTERVAL
                 raw = r.json()
-                formatted = [{'s': x['symbol'], 'c': x['lastPrice'], 'q': x['quoteVolume']} for x in raw]
+                formatted = [
+                    {'s': x['symbol'], 'c': x['lastPrice'], 'q': x['quoteVolume']}
+                    for x in raw
+                ]
                 radar_obj.process_ticker(formatted)
-                if fetch_count % 10 == 0:  # her 10 fetchte bir log bas
-                    radar_obj.log(f"✅ Fetch #{fetch_count} | Pairs: {radar_obj.total_pairs} | Signals: {len(radar_obj.signals)} | History: {len(radar_obj.history)}")
+                if fetch_count % 10 == 0:
+                    radar_obj.log(
+                        f"✅ Fetch #{fetch_count} | "
+                        f"Pairs: {radar_obj.total_pairs} | "
+                        f"Signals: {len(radar_obj.signals)} | "
+                        f"History: {len(radar_obj.history)}"
+                    )
             else:
-                radar_obj.log(f"⚠️ HTTP {r.status_code}")
+                radar_obj.log(f"⚠️ HTTP {r.status_code} → URL değiştiriliyor")
+                radar_obj.rotate_url()
+                retry_delay = min(retry_delay + 5, 60)
+
+        except requests.exceptions.Timeout:
+            radar_obj.log("⏱️ Timeout → URL değiştiriliyor")
+            radar_obj.rotate_url()
+            retry_delay = min(retry_delay + 5, 60)
         except Exception as e:
             radar_obj.log(f"❌ WORKER HATA: {e}")
-        time.sleep(FETCH_INTERVAL)
+            retry_delay = min(retry_delay + 5, 60)
+
+        time.sleep(retry_delay)
 
 
 # ==================== STREAMLIT UI ====================
@@ -257,7 +308,7 @@ h1.caption("⚡ Flash: Anlık hareket | 💎 Confirmed: 3dk + 15dk trend uyumu")
 elapsed = time.time() - radar.last_heartbeat
 status_html = (
     '<span class="status-live">● SYSTEM LIVE</span>'
-    if elapsed < 10
+    if elapsed < 15
     else '<span class="status-offline">● RECONNECTING</span>'
 )
 h2.markdown(f"<div style='margin-top:10px;'>{status_html}</div>", unsafe_allow_html=True)

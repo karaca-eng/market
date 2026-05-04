@@ -46,8 +46,8 @@ BB_UPPER_REJECTION_BARS = 3
 SPOT_EXECUTOR = ThreadPoolExecutor(max_workers=15)
 SPOT_FETCH_INTERVAL = 3
 SPOT_MIN_VOL = 50000        # 500K → 100K (daha fazla sembol yakalasın)
-SPOT_LARGE_TRADE_USD = 10000   # 100K → 50K (large daha erken yakalansın)
-SPOT_WHALE_TRADE_USD = 5000  # 300K → 150K (whale daha sık görünsün)
+SPOT_LARGE_TRADE_USD = 30000   # 100K → 50K (large daha erken yakalansın)
+SPOT_WHALE_TRADE_USD = 10000  # 300K → 150K (whale daha sık görünsün)
 SPOT_MEGA_WHALE_USD = 500000   # 1M → 500K (mega nadir zaten, yakalansın)
 SPOT_COOLDOWN = 45             # 60 → 45 (daha sık güncelleme)
 MAX_SPOT_SIGNALS = 150         # 100 → 150 (daha fazla sinyal göster)

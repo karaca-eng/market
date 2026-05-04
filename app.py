@@ -42,16 +42,16 @@ DEATH_CROSS_MA_FAST = 50
 DEATH_CROSS_MA_SLOW = 200
 BB_UPPER_REJECTION_BARS = 3
 
-# SPOT AYARLARI - SADECE BALINA FOKUSLU
+# SPOT AYARLARI - DENGELİ BALINA FOKUSLU
 SPOT_EXECUTOR = ThreadPoolExecutor(max_workers=15)
 SPOT_FETCH_INTERVAL = 3
-SPOT_MIN_VOL = 500000
-SPOT_LARGE_TRADE_USD = 100000
-SPOT_WHALE_TRADE_USD = 300000
-SPOT_MEGA_WHALE_USD = 1000000
-SPOT_COOLDOWN = 60
-MAX_SPOT_SIGNALS = 100
-SPOT_MAX_INTERESTING = 50
+SPOT_MIN_VOL = 100000          # 500K → 100K (daha fazla sembol yakalasın)
+SPOT_LARGE_TRADE_USD = 50000   # 100K → 50K (large daha erken yakalansın)
+SPOT_WHALE_TRADE_USD = 150000  # 300K → 150K (whale daha sık görünsün)
+SPOT_MEGA_WHALE_USD = 500000   # 1M → 500K (mega nadir zaten, yakalansın)
+SPOT_COOLDOWN = 45             # 60 → 45 (daha sık güncelleme)
+MAX_SPOT_SIGNALS = 150         # 100 → 150 (daha fazla sinyal göster)
+SPOT_MAX_INTERESTING = 80      # 50 → 80 (daha fazla sembol analiz etsin)
 
 BINANCE_REST_URLS = [
     "https://fapi.binance.com",

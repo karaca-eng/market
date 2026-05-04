@@ -35,17 +35,32 @@ MACD_RESISTANCE_LOOKBACK = 20
 # SHORT BIG MOVE AYARLARI
 SHORT_EXECUTOR = ThreadPoolExecutor(max_workers=20)
 SHORT_COOLDOWN = 600
-MA200_MIN_BARS_ABOVE = 20        # MA200 üstünde kaç bar geçirmeli
-RSI_OVERBOUGHT = 70              # RSI aşırı alım eşiği
-RSI_BEARISH_DIV_LOOKBACK = 14   # Bearish divergence için kaç bar bakılacak
-DEATH_CROSS_MA_FAST = 50        # Death cross hızlı MA
-DEATH_CROSS_MA_SLOW = 200       # Death cross yavaş MA
-BB_UPPER_REJECTION_BARS = 3     # BB üst bant reddi için son kaç bar
+MA200_MIN_BARS_ABOVE = 20
+RSI_OVERBOUGHT = 70
+RSI_BEARISH_DIV_LOOKBACK = 14
+DEATH_CROSS_MA_FAST = 50
+DEATH_CROSS_MA_SLOW = 200
+BB_UPPER_REJECTION_BARS = 3
+
+# SPOT AYARLARI
+SPOT_EXECUTOR = ThreadPoolExecutor(max_workers=10)
+SPOT_FETCH_INTERVAL = 5
+SPOT_MIN_VOL = 20000
+SPOT_LARGE_TRADE_USD = 50000
+SPOT_WHALE_TRADE_USD = 200000
+SPOT_COOLDOWN = 30
+MAX_SPOT_SIGNALS = 200
 
 BINANCE_REST_URLS = [
     "https://fapi.binance.com",
     "https://fapi1.binance.com",
     "https://fapi2.binance.com",
+]
+
+BINANCE_SPOT_URLS = [
+    "https://api.binance.com",
+    "https://api1.binance.com",
+    "https://api2.binance.com",
 ]
 
 # ==================== HELPERS ====================
@@ -69,6 +84,7 @@ class MarketRadar:
         self.last_reset_4h_block = datetime.now().hour // 4
         self.headers = {'User-Agent': 'Mozilla/5.0'}
         self.rest_base_url = BINANCE_REST_URLS[0]
+        self.spot_base_url = BINANCE_SPOT_URLS[0]
         self.price_cache_15m = {}
         self.debug_log = []
 
@@ -90,6 +106,14 @@ class MarketRadar:
         self.shortmove_candidates = {}
         self.shortmove_last_trigger = {}
 
+        # SPOT state
+        self.spot_signals = []
+        self.spot_last_trade_id = {}
+        self.spot_last_fetch = {}
+        self.spot_price_cache = {}
+        self.spot_last_heartbeat = 0
+        self.spot_total_pairs = 0
+
     def log(self, msg):
         t = datetime.now().strftime("%H:%M:%S")
         full = f"[{t}] {msg}"
@@ -105,14 +129,25 @@ class MarketRadar:
                 r = requests.get(f"{url}/fapi/v1/ping", timeout=3)
                 if r.status_code == 200:
                     self.rest_base_url = url
-                    self.log(f"✅ Binance bağlantısı OK: {url}")
+                    self.log(f"✅ Binance Futures OK: {url}")
                     return url
-                else:
-                    self.log(f"⚠️ {url} → status {r.status_code}")
             except Exception as e:
                 self.log(f"❌ {url} → HATA: {e}")
-        self.log("🔴 Hiçbir Binance URL'e bağlanılamadı!")
+        self.log("🔴 Hiçbir Futures URL'e bağlanılamadı!")
         return self.rest_base_url
+
+    def get_working_spot_url(self):
+        for url in BINANCE_SPOT_URLS:
+            try:
+                r = requests.get(f"{url}/api/v3/ping", timeout=3)
+                if r.status_code == 200:
+                    self.spot_base_url = url
+                    self.log(f"✅ Binance Spot OK: {url}")
+                    return url
+            except Exception as e:
+                self.log(f"❌ Spot {url} → HATA: {e}")
+        self.log("🔴 Hiçbir Spot URL'e bağlanılamadı!")
+        return self.spot_base_url
 
     def check_resets(self):
         now = datetime.now()
@@ -228,6 +263,192 @@ class MarketRadar:
                 self.signals.pop()
 
     # ================================================================
+    # SPOT İŞLEMLERİ
+    # ================================================================
+
+    def fetch_spot_ticker(self):
+        """Spot piyasasındaki tüm USDT çiftlerini çek"""
+        try:
+            url = f"{self.spot_base_url}/api/v3/ticker/24hr"
+            r = requests.get(url, timeout=5, headers=self.headers)
+            if r.status_code == 200:
+                return r.json()
+        except Exception as e:
+            self.log(f"❌ Spot ticker hata: {e}")
+        return []
+
+    def fetch_spot_recent_trades(self, symbol, limit=20):
+        """Belirli bir spot sembol için son işlemleri çek"""
+        try:
+            url = f"{self.spot_base_url}/api/v3/trades?symbol={symbol}&limit={limit}"
+            r = requests.get(url, timeout=3, headers=self.headers)
+            if r.status_code == 200:
+                return r.json()
+        except:
+            pass
+        return []
+
+    def process_spot_ticker(self, data):
+        """Spot ticker verilerini işle, büyük hacimli hareketleri tespit et"""
+        now = time.time()
+        interesting = []
+
+        for item in data:
+            symbol = item.get('symbol', '')
+            if not symbol.endswith('USDT'):
+                continue
+            try:
+                price = float(item['lastPrice'])
+                chg_pct = float(item['priceChangePercent'])
+                quote_vol = float(item['quoteVolume'])
+                trades_count = int(item['count'])
+                high = float(item['highPrice'])
+                low = float(item['lowPrice'])
+                bid = float(item.get('bidPrice', price))
+                ask = float(item.get('askPrice', price))
+                spread_pct = ((ask - bid) / price * 100) if price > 0 else 0
+
+                # Filtrele: düşük hacimli atla
+                if quote_vol < SPOT_MIN_VOL:
+                    continue
+
+                # İlginç durumlar
+                if abs(chg_pct) >= 2.0 or quote_vol >= 5_000_000:
+                    interesting.append({
+                        'symbol': symbol,
+                        'price': price,
+                        'chg_pct': chg_pct,
+                        'quote_vol': quote_vol,
+                        'trades_count': trades_count,
+                        'high': high,
+                        'low': low,
+                        'spread_pct': spread_pct,
+                    })
+            except:
+                continue
+
+        with self.lock:
+            self.spot_last_heartbeat = now
+            self.spot_total_pairs = len([x for x in data if x.get('symbol', '').endswith('USDT')])
+
+        # En ilginç 30 sembolü işle
+        interesting.sort(key=lambda x: abs(x['chg_pct']), reverse=True)
+        for item in interesting[:30]:
+            SPOT_EXECUTOR.submit(self._analyze_spot_symbol, item, now)
+
+    def _analyze_spot_symbol(self, item, now):
+        """Spot sembol için detaylı analiz + son büyük işlemler"""
+        symbol = item['symbol']
+        sym_clean = symbol.replace("USDT", "")
+        price = item['price']
+        chg_pct = item['chg_pct']
+        quote_vol = item['quote_vol']
+
+        # Cooldown kontrolü
+        with self.lock:
+            last = self.spot_last_fetch.get(sym_clean, 0)
+            if now - last < SPOT_COOLDOWN:
+                return
+            self.spot_last_fetch[sym_clean] = now
+
+        # Son işlemleri çek
+        trades = self.fetch_spot_recent_trades(symbol, limit=50)
+        if not trades:
+            return
+
+        # Büyük işlemleri bul
+        large_trades = []
+        buy_vol = 0.0
+        sell_vol = 0.0
+        total_usd = 0.0
+
+        for t in trades:
+            try:
+                qty = float(t['qty'])
+                trade_price = float(t['price'])
+                usd_val = qty * trade_price
+                is_buyer_maker = t.get('isBuyerMaker', False)
+                # isBuyerMaker=True → satıcı agresif (SELL), False → alıcı agresif (BUY)
+                side = "SELL" if is_buyer_maker else "BUY"
+
+                if side == "BUY":
+                    buy_vol += usd_val
+                else:
+                    sell_vol += usd_val
+                total_usd += usd_val
+
+                if usd_val >= SPOT_LARGE_TRADE_USD:
+                    large_trades.append({
+                        'usd': usd_val,
+                        'qty': qty,
+                        'price': trade_price,
+                        'side': side,
+                        'time': t.get('time', 0),
+                    })
+            except:
+                continue
+
+        if not large_trades and abs(chg_pct) < 3.0:
+            return
+
+        # Alım/satım baskısı
+        total_vol = buy_vol + sell_vol
+        buy_ratio = buy_vol / total_vol if total_vol > 0 else 0.5
+
+        # Sinyal tipi belirle
+        has_whale = any(t['usd'] >= SPOT_WHALE_TRADE_USD for t in large_trades)
+        dominant_side = "BUY" if buy_ratio >= 0.6 else "SELL" if buy_ratio <= 0.4 else "NEUTRAL"
+
+        # Etiket
+        if has_whale and abs(chg_pct) >= 2.0:
+            if chg_pct > 0:
+                signal_type = "🐋 WHALE BUY"
+                signal_color = "whale-buy"
+            else:
+                signal_type = "🐋 WHALE SELL"
+                signal_color = "whale-sell"
+        elif abs(chg_pct) >= 5.0:
+            signal_type = "🔥 SURGE BUY" if chg_pct > 0 else "💥 SURGE SELL"
+            signal_color = "surge-buy" if chg_pct > 0 else "surge-sell"
+        elif abs(chg_pct) >= 2.0:
+            signal_type = "📈 SPOT BUY" if chg_pct > 0 else "📉 SPOT SELL"
+            signal_color = "spot-buy" if chg_pct > 0 else "spot-sell"
+        elif large_trades:
+            signal_type = "💰 LARGE BUY" if dominant_side == "BUY" else "💰 LARGE SELL"
+            signal_color = "large-buy" if dominant_side == "BUY" else "large-sell"
+        else:
+            return
+
+        t_str = datetime.now().strftime("%H:%M:%S")
+        top_trade = max(large_trades, key=lambda x: x['usd']) if large_trades else None
+        whale_usd = top_trade['usd'] if top_trade else 0
+
+        with self.lock:
+            # Duplikat kontrol
+            for s in self.spot_signals[:5]:
+                if s.get('Symbol') == sym_clean and s.get('SignalType') == signal_type:
+                    return
+
+            self.spot_signals.insert(0, {
+                "Time": t_str,
+                "Symbol": sym_clean,
+                "Price": f"{price:.6f}" if price < 0.01 else (f"{price:.4f}" if price < 1 else f"{price:.2f}"),
+                "Chg": chg_pct,
+                "QuoteVol": quote_vol,
+                "BuyRatio": round(buy_ratio * 100, 1),
+                "SellRatio": round((1 - buy_ratio) * 100, 1),
+                "LargeTrades": len(large_trades),
+                "WhaleUSD": whale_usd,
+                "SignalType": signal_type,
+                "SignalColor": signal_color,
+                "HasWhale": has_whale,
+                "DominantSide": dominant_side,
+            })
+            self.log(f"💱 SPOT: {sym_clean} {signal_type} {chg_pct:+.2f}% | Whale: ${whale_usd:,.0f}")
+            if len(self.spot_signals) > MAX_SPOT_SIGNALS:
+                self.spot_signals.pop()
+
+    # ================================================================
     # MACD PARALEL YUKSELIS
     # ================================================================
 
@@ -244,8 +465,11 @@ class MarketRadar:
             self.macd_last_trigger[symbol] = now
             MACD_EXECUTOR.submit(self._run_macd_analysis, symbol, price)
 
-    def _fetch_klines(self, symbol, interval, limit):
-        url = f"{self.rest_base_url}/fapi/v1/klines?symbol={symbol}&interval={interval}&limit={limit}"
+    def _fetch_klines(self, symbol, interval, limit, is_spot=False):
+        if is_spot:
+            url = f"{self.spot_base_url}/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}"
+        else:
+            url = f"{self.rest_base_url}/fapi/v1/klines?symbol={symbol}&interval={interval}&limit={limit}"
         try:
             resp = requests.get(url, timeout=3)
             if resp.status_code != 200:
@@ -256,8 +480,11 @@ class MarketRadar:
         except:
             return None
 
-    def _fetch_klines_ohlc(self, symbol, interval, limit):
-        url = f"{self.rest_base_url}/fapi/v1/klines?symbol={symbol}&interval={interval}&limit={limit}"
+    def _fetch_klines_ohlc(self, symbol, interval, limit, is_spot=False):
+        if is_spot:
+            url = f"{self.spot_base_url}/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}"
+        else:
+            url = f"{self.rest_base_url}/fapi/v1/klines?symbol={symbol}&interval={interval}&limit={limit}"
         try:
             resp = requests.get(url, timeout=3)
             if resp.status_code != 200:
@@ -348,7 +575,6 @@ class MarketRadar:
                 if sig.get('Symbol') == sym_clean and sig.get('MACD') == "":
                     sig['MACD'] = macd_tag
                     updated = True
-                    self.log(f"🔷 MACD TAG eklendi: {sym_clean} → {macd_tag}")
                     break
 
         if not updated:
@@ -363,7 +589,6 @@ class MarketRadar:
                 score=60,
                 macd_tag=macd_tag,
             )
-            self.log(f"🔷 MACD SİNYAL: {sym_clean} {macd_tag}")
 
     # ================================================================
     # BIG MOVE HUNTER (LONG)
@@ -425,7 +650,6 @@ class MarketRadar:
 
         if closes[-1] <= ma200[-1]:
             return False, 0, ma200[-1], 0.0
-
         if closes[-2] >= ma200[-2]:
             return False, 0, ma200[-1], 0.0
 
@@ -516,7 +740,6 @@ class MarketRadar:
             return
         if len(conditions_met) < 2 and not ma200_break:
             return
-
         if total_score < 50:
             return
 
@@ -536,7 +759,6 @@ class MarketRadar:
                     "Status": "Squeeze Tespiti",
                     "BB_Pos": f"{bb_pos:.2f}",
                 }
-            self.log(f"🎯 BIG MOVE RADAR: {sym_clean} Squeeze({squeeze_dur}) BB-pos:{bb_pos:.2f}")
             return
 
         with self.lock:
@@ -555,18 +777,11 @@ class MarketRadar:
                 "MA200_Dist": f"{dist_pct:.2f}%" if ma200_break else "—",
                 "MACD_1H": f"H:{h_now:.3f}" if macd_break else "—",
             })
-            self.log(f"🚀🚀🚀 BIG MOVE SINYAL: {sym_clean} | {' | '.join(conditions_met)} | Score:{total_score}")
             if len(self.bigmove_signals) > MAX_DISPLAY_ROWS:
                 self.bigmove_signals.pop()
 
     # ================================================================
     # SHORT BIG MOVE HUNTER
-    # Kriterler:
-    #   1. MA200 Breakdown  — fiyat 20+ bar MA200 üstündeyken altına kırılıyor (long'un tersi)
-    #   2. Death Cross      — 4H'ta 50MA, 200MA'nın altına geçiyor
-    #   3. RSI Overbought + Bearish Divergence — 1H RSI>70 + fiyat yüksek ama RSI düşüyor
-    #   4. BB Upper Rejection — BB sıkışması sonrası üst banttan reddediliyor
-    #   5. MACD Bearish Crossover — 1H MACD sinyal çizgisinin altına geçiyor, histogram negatife dönüyor
     # ================================================================
 
     def _maybe_trigger_shortmove(self, symbol, price, now):
@@ -578,13 +793,11 @@ class MarketRadar:
             return
         past_1m = next((x for x in reversed(hist) if now - x[0] >= 60), hist[0])
         p_chg_1m = ((price - past_1m[1]) / past_1m[1]) * 100
-        # Short için fiyat düşüyor olmalı (negatif değişim)
         if p_chg_1m <= -0.35:
             self.shortmove_last_trigger[symbol] = now
             SHORT_EXECUTOR.submit(self._run_shortmove_analysis, symbol, price)
 
     def _ma200_breakdown_analysis(self, df: pd.DataFrame) -> tuple:
-        """Fiyat MA200'ün altına kırılıyor mu? (Long'daki breakout'un tersi)"""
         if len(df) < 250:
             return False, 0, 0.0, 0.0
 
@@ -592,15 +805,11 @@ class MarketRadar:
         closes = df['close'].values
         ma200 = df['ma200'].values
 
-        # Son bar MA200 altında olmalı
         if closes[-1] >= ma200[-1]:
             return False, 0, ma200[-1], 0.0
-
-        # Bir önceki bar MA200 üstünde olmalı (yeni kırılma)
         if closes[-2] <= ma200[-2]:
             return False, 0, ma200[-1], 0.0
 
-        # Kırılmadan önce kaç bar MA200 üstündeydi?
         bars_above = 0
         for i in range(2, min(len(closes), 300)):
             if not np.isnan(ma200[-i]) and closes[-i] > ma200[-i]:
@@ -611,12 +820,10 @@ class MarketRadar:
         if bars_above < MA200_MIN_BARS_ABOVE:
             return False, bars_above, ma200[-1], 0.0
 
-        # MA200'den ne kadar aşağıda?
-        distance_pct = ((closes[-1] - ma200[-1]) / ma200[-1]) * 100  # negatif değer
+        distance_pct = ((closes[-1] - ma200[-1]) / ma200[-1]) * 100
         return True, bars_above, ma200[-1], distance_pct
 
     def _death_cross_analysis(self, df: pd.DataFrame) -> tuple:
-        """4H Death Cross: 50MA, 200MA'nın altına geçiyor mu?"""
         if len(df) < 210:
             return False, 0.0, 0.0
 
@@ -629,22 +836,14 @@ class MarketRadar:
         if np.isnan(ma50[-1]) or np.isnan(ma200[-1]):
             return False, 0.0, 0.0
 
-        # Yeni death cross: önceki bar ma50 > ma200, şimdi ma50 < ma200
         if ma50[-1] >= ma200[-1]:
             return False, ma50[-1], ma200[-1]
-
         if ma50[-2] <= ma200[-2]:
             return False, ma50[-1], ma200[-1]
 
         return True, ma50[-1], ma200[-1]
 
     def _rsi_overbought_bearish_div(self, closes: pd.Series) -> tuple:
-        """
-        1H RSI analizi:
-        - RSI > 70 (overbought) VE
-        - Bearish divergence: fiyat yeni yüksek yaparken RSI düşüyor
-        Dönen: (is_signal, rsi_now, is_overbought, is_bearish_div)
-        """
         if len(closes) < RSI_BEARISH_DIV_LOOKBACK + 5:
             return False, 0.0, False, False
 
@@ -659,7 +858,6 @@ class MarketRadar:
         rsi_now = rsi.iloc[-1]
         is_overbought = rsi_now > RSI_OVERBOUGHT
 
-        # Bearish divergence: son 14 bar içinde fiyat yüksek ama RSI daha düşük
         lookback = RSI_BEARISH_DIV_LOOKBACK
         price_high_recent = closes.iloc[-1]
         price_high_prev = closes.iloc[-lookback:-1].max()
@@ -667,18 +865,12 @@ class MarketRadar:
         rsi_at_prev_high_idx = closes.iloc[-lookback:-1].idxmax()
         rsi_at_prev_high = rsi.loc[rsi_at_prev_high_idx] if rsi_at_prev_high_idx in rsi.index else rsi.iloc[-lookback]
 
-        # Fiyat yeni yüksek yaptı ama RSI yapmadı
         is_bearish_div = (price_high_recent > price_high_prev) and (rsi_at_recent < rsi_at_prev_high - 2)
 
         is_signal = is_overbought or is_bearish_div
         return is_signal, round(float(rsi_now), 1), is_overbought, is_bearish_div
 
     def _bb_upper_rejection(self, df: pd.DataFrame) -> tuple:
-        """
-        BB üst bantından fiyat reddediliyor mu?
-        - BB squeeze sonrası üst banda temas
-        - Son barlarda fiyat üst bandın altına dönüyor (red mum)
-        """
         if len(df) < 30:
             return False, 0.0
 
@@ -692,17 +884,13 @@ class MarketRadar:
         if len(recent_bw) < 10:
             return False, 0.0
 
-        # Son fiyat ve üst bant
         last_close = df['close'].iloc[-1]
         last_open = df['open'].iloc[-1]
         last_upper = df['upper'].iloc[-1]
-        last_high = df['high'].iloc[-1]
 
-        # Son BB pozisyonu (1.0 = üst bant, 0.0 = alt bant)
         bb_range = df['upper'].iloc[-1] - df['lower'].iloc[-1]
         bb_pos = (last_close - df['lower'].iloc[-1]) / bb_range if bb_range > 0 else 0.5
 
-        # Üst banttan red: son 3 bar içinde herhangi biri üst bandı test etti mi?
         touched_upper = False
         for i in range(1, BB_UPPER_REJECTION_BARS + 1):
             if len(df) >= i:
@@ -710,7 +898,6 @@ class MarketRadar:
                     touched_upper = True
                     break
 
-        # Şu an fiyat üst bandın altında ve düşüyor (bearish mum)
         bearish_candle = last_close < last_open
         below_upper = last_close < last_upper
 
@@ -719,11 +906,6 @@ class MarketRadar:
         return is_rejection, round(bb_pos, 2)
 
     def _macd_bearish_crossover(self, closes: pd.Series) -> tuple:
-        """
-        1H MACD bearish crossover:
-        - MACD çizgisi sinyal çizgisinin altına geçiyor
-        - Histogram negatife dönüyor veya negatif histogram büyüyor
-        """
         if len(closes) < 40:
             return False, 0.0, 0.0, 0.0
 
@@ -740,13 +922,8 @@ class MarketRadar:
         s_prev = signal_line.iloc[-2]
         h_prev = histogram.iloc[-2]
 
-        # Bearish crossover: MACD sinyal çizgisinin altına geçiyor
         fresh_bearish_cross = (m_prev >= s_prev) and (m_now < s_now)
-
-        # Histogram negatife dönüyor
         hist_turning_negative = h_prev >= 0 and h_now < 0
-
-        # Zaten negatif bölgede ama histogram daha da büyüyor (güçlü satış baskısı)
         hist_expanding_negative = h_now < 0 and h_now < h_prev and m_now < 0
 
         is_bearish = fresh_bearish_cross or hist_turning_negative or hist_expanding_negative
@@ -761,32 +938,19 @@ class MarketRadar:
             if now - self.shortmove_sent.get(sym_clean, 0) < SHORT_COOLDOWN:
                 return
 
-        # Veri çekimi
         df_4h = self._fetch_klines_ohlc(symbol, "4h", 300)
-        df_4h_short = self._fetch_klines_ohlc(symbol, "4h", 60)  # BB rejection için
+        df_4h_short = self._fetch_klines_ohlc(symbol, "4h", 60)
         closes_1h = self._fetch_klines(symbol, "1h", 100)
-        df_1h = self._fetch_klines_ohlc(symbol, "1h", 60)
 
         if df_4h is None or closes_1h is None:
             return
 
-        # 5 SHORT KRİTERİ ANALİZİ
-        # 1. MA200 Breakdown (4H)
         ma200_break, bars_above, ma200_val, dist_pct = self._ma200_breakdown_analysis(df_4h)
-
-        # 2. Death Cross (4H)
         death_cross, ma50_val, ma200_dc_val = self._death_cross_analysis(df_4h)
-
-        # 3. RSI Overbought + Bearish Divergence (1H)
         rsi_signal, rsi_now, is_overbought, is_bearish_div = self._rsi_overbought_bearish_div(closes_1h)
-
-        # 4. BB Upper Rejection (4H)
         bb_rejection, bb_pos = self._bb_upper_rejection(df_4h_short if df_4h_short is not None else df_4h)
-
-        # 5. MACD Bearish Crossover (1H)
         macd_bearish, macd_m, macd_s, macd_h = self._macd_bearish_crossover(closes_1h)
 
-        # SKORLAMA
         conditions_met = []
         total_score = 0
 
@@ -821,17 +985,13 @@ class MarketRadar:
 
         if not conditions_met:
             return
-
-        # En az 2 koşul veya MA200 breakdown tek başına yeterli
         if len(conditions_met) < 2 and not ma200_break:
             return
-
         if total_score < 50:
             return
 
         t_str = datetime.now().strftime("%H:%M:%S")
 
-        # Sadece BB sıkışma varsa (henüz breakout yok) → radar listesine ekle
         if bb_rejection and not ma200_break and not death_cross and len(conditions_met) == 1:
             with self.lock:
                 self.shortmove_candidates[sym_clean] = {
@@ -844,10 +1004,8 @@ class MarketRadar:
                     "BB_Pos": f"{bb_pos:.2f}",
                     "RSI": str(rsi_now),
                 }
-            self.log(f"🔴 SHORT RADAR: {sym_clean} BB-Reject BB-pos:{bb_pos:.2f} RSI:{rsi_now}")
             return
 
-        # Sinyal üret
         with self.lock:
             if now - self.shortmove_sent.get(sym_clean, 0) < SHORT_COOLDOWN:
                 return
@@ -869,22 +1027,19 @@ class MarketRadar:
                 "RSI": str(rsi_now),
                 "MACD_1H": f"H:{macd_h:.3f}" if macd_bearish else "—",
             })
-            self.log(f"🔻🔻🔻 SHORT MOVE SİNYAL: {sym_clean} | {' | '.join(conditions_met)} | Score:{total_score}")
             if len(self.shortmove_signals) > MAX_DISPLAY_ROWS:
                 self.shortmove_signals.pop()
 
 
-# ==================== WORKER ====================
+# ==================== WORKERS ====================
 @st.cache_resource
 def get_radar_instance():
     return MarketRadar()
 
 
 def binance_worker(radar_obj):
-    radar_obj.log(">>> WORKER THREAD BASLADI")
-    working_url = radar_obj.get_working_rest_url()
-    radar_obj.log(f">>> Kullanilan URL: {working_url}")
-
+    radar_obj.log(">>> FUTURES WORKER BASLADI")
+    radar_obj.get_working_rest_url()
     fetch_count = 0
     while True:
         try:
@@ -897,115 +1052,226 @@ def binance_worker(radar_obj):
                 radar_obj.process_ticker(formatted)
                 if fetch_count % 10 == 0:
                     radar_obj.log(
-                        f"✅ Fetch #{fetch_count} | Pairs: {radar_obj.total_pairs} | "
-                        f"Signals: {len(radar_obj.signals)} | "
-                        f"MACD Radar: {len(radar_obj.macd_candidates)} | "
-                        f"BigMove: {len(radar_obj.bigmove_signals)} | "
-                        f"ShortMove: {len(radar_obj.shortmove_signals)}"
+                        f"✅ Futures Fetch #{fetch_count} | Pairs: {radar_obj.total_pairs} | "
+                        f"Signals: {len(radar_obj.signals)}"
                     )
             else:
-                radar_obj.log(f"⚠️ HTTP {r.status_code}")
+                radar_obj.log(f"⚠️ Futures HTTP {r.status_code}")
         except Exception as e:
-            radar_obj.log(f"❌ WORKER HATA: {e}")
+            radar_obj.log(f"❌ FUTURES WORKER HATA: {e}")
         time.sleep(FETCH_INTERVAL)
+
+
+def spot_worker(radar_obj):
+    radar_obj.log(">>> SPOT WORKER BASLADI")
+    radar_obj.get_working_spot_url()
+    fetch_count = 0
+    while True:
+        try:
+            data = radar_obj.fetch_spot_ticker()
+            if data:
+                fetch_count += 1
+                radar_obj.process_spot_ticker(data)
+                if fetch_count % 5 == 0:
+                    radar_obj.log(
+                        f"💱 Spot Fetch #{fetch_count} | Pairs: {radar_obj.spot_total_pairs} | "
+                        f"Spot Signals: {len(radar_obj.spot_signals)}"
+                    )
+            else:
+                radar_obj.log("⚠️ Spot veri alınamadı")
+        except Exception as e:
+            radar_obj.log(f"❌ SPOT WORKER HATA: {e}")
+        time.sleep(SPOT_FETCH_INTERVAL)
 
 
 # ==================== STREAMLIT UI ====================
 st.set_page_config(layout="wide", page_title="Market Radar Pro")
 
 st.markdown("""
-    <style>
-    .main { background-color: #0e1117; }
-    .status-live { color: #00ff88; font-weight: bold; border: 1px solid #00ff88; padding: 2px 10px; border-radius: 15px; font-size: 0.8rem; }
-    .status-offline { color: #ff4b4b; font-weight: bold; border: 1px solid #ff4b4b; padding: 2px 10px; border-radius: 15px; font-size: 0.8rem; }
-    .pump-label  { background-color: #00ff88; color: black;  padding: 2px 8px; border-radius: 4px; font-weight: bold; }
-    .dump-label  { background-color: #ff4b4b; color: white;  padding: 2px 8px; border-radius: 4px; font-weight: bold; }
-    .buy-label   { background-color: #1a7f4b; color: #afffcf; padding: 2px 8px; border-radius: 4px; font-weight: bold; }
-    .sell-label  { background-color: #7f1a1a; color: #ffcfcf; padding: 2px 8px; border-radius: 4px; font-weight: bold; }
-    .mode-confirmed { background-color: #1abc9c; color: #fff; padding: 2px 8px; border-radius: 4px; font-weight: bold; }
-    .mode-flash { background-color: #e67e22; color: #fff; padding: 2px 8px; border-radius: 4px; font-weight: bold; }
-    .mode-macd  { background-color: #8e44ad; color: #fff; padding: 2px 8px; border-radius: 4px; font-weight: bold; }
-    .mode-bigmove { background-color: #f39c12; color: #000; padding: 2px 8px; border-radius: 4px; font-weight: bold; }
-    .mode-shortmove { background-color: #c0392b; color: #fff; padding: 2px 8px; border-radius: 4px; font-weight: bold; }
-    .macd-tag   { background-color: #2c1654; color: #c39bd3; padding: 2px 7px; border-radius: 4px; font-size: 0.78rem; font-weight: bold; border: 1px solid #8e44ad; }
-    .bigmove-tag { background-color: #3d2208; color: #f5b041; padding: 2px 7px; border-radius: 4px; font-size: 0.78rem; font-weight: bold; border: 1px solid #f39c12; }
-    .shortmove-tag { background-color: #3d0808; color: #ff7675; padding: 2px 7px; border-radius: 4px; font-size: 0.78rem; font-weight: bold; border: 1px solid #c0392b; }
-    .stat-card { background-color: #1e2127; padding: 10px; border-radius: 10px; margin-bottom: 10px; border-left: 5px solid #f1c40f; }
-    .debug-box { background-color: #1a1a2e; border: 1px solid #333; border-radius: 8px; padding: 10px; font-family: monospace; font-size: 0.75rem; color: #aaa; max-height: 200px; overflow-y: auto; }
-    table { width: 100%; border-collapse: collapse; }
-    th, td { white-space: nowrap; padding: 12px 15px; text-align: left; border-bottom: 1px solid #222; }
-    .sym-link { color: #f1c40f; text-decoration: none; font-weight: bold; font-size: 1.1rem; }
-    .sym-link:hover { color: #fff; }
-    .green-arrow { color: #00ff88; font-weight: bold; }
-    .red-arrow   { color: #ff4b4b; font-weight: bold; }
-    .row-flash-pump { background-color: rgba(0, 255, 136, 0.22) !important; border-left: 5px solid #00ff88 !important; }
-    .row-flash-dump { background-color: rgba(255, 75,  75,  0.22) !important; border-left: 5px solid #ff4b4b !important; }
-    .row-conf-pump  { background-color: rgba(0, 255, 136, 0.08) !important; }
-    .row-conf-dump  { background-color: rgba(255, 75,  75,  0.08) !important; }
-    .row-macd       { background-color: rgba(142, 68, 173, 0.12) !important; border-left: 3px solid #8e44ad !important; }
-    .row-bigmove    { background-color: rgba(243, 156, 18, 0.15) !important; border-left: 4px solid #f39c12 !important; }
-    .row-shortmove  { background-color: rgba(192, 57, 43, 0.18) !important; border-left: 4px solid #c0392b !important; }
-    .macd-radar-card { background: #1a1030; border: 1px solid #8e44ad; border-radius: 8px; padding: 8px 12px; margin-bottom: 6px; }
-    .macd-radar-sym { color: #c39bd3; font-weight: bold; font-size: 1rem; }
-    .macd-radar-tag { color: #f0c3ff; font-size: 0.82rem; }
-    .macd-radar-time { color: #666; font-size: 0.72rem; }
-    .bigmove-card { background: #2a1d0a; border: 1px solid #f39c12; border-radius: 8px; padding: 10px 14px; margin-bottom: 8px; }
-    .bigmove-sym { color: #f5b041; font-weight: bold; font-size: 1.1rem; }
-    .bigmove-cond { color: #f8c471; font-size: 0.85rem; }
-    .bigmove-score { color: #fff; font-weight: bold; font-size: 0.9rem; }
-    .bigmove-time { color: #888; font-size: 0.72rem; }
-    .bigmove-radar-card { background: #1a1508; border: 1px solid #7f8c8d; border-radius: 8px; padding: 8px 12px; margin-bottom: 6px; }
-    .bigmove-radar-sym { color: #d5dbdb; font-weight: bold; font-size: 1rem; }
-    .bigmove-radar-cond { color: #aab7b8; font-size: 0.82rem; }
-    .shortmove-card { background: #1f0a0a; border: 1px solid #c0392b; border-radius: 8px; padding: 10px 14px; margin-bottom: 8px; }
-    .shortmove-sym { color: #ff7675; font-weight: bold; font-size: 1.1rem; }
-    .shortmove-cond { color: #fab1a0; font-size: 0.85rem; }
-    .shortmove-radar-card { background: #1a0a08; border: 1px solid #7f3030; border-radius: 8px; padding: 8px 12px; margin-bottom: 6px; }
-    .shortmove-radar-sym { color: #e17055; font-weight: bold; font-size: 1rem; }
-    .shortmove-radar-cond { color: #d63031; font-size: 0.82rem; }
-    </style>
+<style>
+.main { background-color: #0e1117; }
+
+/* Status */
+.status-live { color: #00ff88; font-weight: bold; border: 1px solid #00ff88; padding: 2px 10px; border-radius: 15px; font-size: 0.8rem; }
+.status-offline { color: #ff4b4b; font-weight: bold; border: 1px solid #ff4b4b; padding: 2px 10px; border-radius: 15px; font-size: 0.8rem; }
+
+/* Sayfa seçici */
+.page-nav-container {
+    display: flex;
+    gap: 8px;
+    margin-bottom: 16px;
+    padding: 10px 0;
+    border-bottom: 2px solid #222;
+    flex-wrap: wrap;
+}
+.page-btn {
+    padding: 8px 20px;
+    border-radius: 8px;
+    border: 1px solid #444;
+    background: #1e2127;
+    color: #aaa;
+    cursor: pointer;
+    font-size: 0.95rem;
+    font-weight: bold;
+    text-decoration: none;
+    transition: all 0.2s;
+}
+.page-btn:hover { background: #2a2d35; color: #fff; border-color: #666; }
+.page-btn.active-futures { background: #1a3a1a; color: #00ff88; border-color: #00ff88; }
+.page-btn.active-longbig { background: #2a1d08; color: #f5b041; border-color: #f39c12; }
+.page-btn.active-shortbig { background: #2a0808; color: #ff7675; border-color: #c0392b; }
+.page-btn.active-spot { background: #0a1a2a; color: #74b9ff; border-color: #0984e3; }
+
+/* Labels */
+.pump-label  { background-color: #00ff88; color: black;  padding: 2px 8px; border-radius: 4px; font-weight: bold; }
+.dump-label  { background-color: #ff4b4b; color: white;  padding: 2px 8px; border-radius: 4px; font-weight: bold; }
+.buy-label   { background-color: #1a7f4b; color: #afffcf; padding: 2px 8px; border-radius: 4px; font-weight: bold; }
+.sell-label  { background-color: #7f1a1a; color: #ffcfcf; padding: 2px 8px; border-radius: 4px; font-weight: bold; }
+.mode-confirmed { background-color: #1abc9c; color: #fff; padding: 2px 8px; border-radius: 4px; font-weight: bold; }
+.mode-flash { background-color: #e67e22; color: #fff; padding: 2px 8px; border-radius: 4px; font-weight: bold; }
+.mode-macd  { background-color: #8e44ad; color: #fff; padding: 2px 8px; border-radius: 4px; font-weight: bold; }
+.mode-bigmove { background-color: #f39c12; color: #000; padding: 2px 8px; border-radius: 4px; font-weight: bold; }
+.mode-shortmove { background-color: #c0392b; color: #fff; padding: 2px 8px; border-radius: 4px; font-weight: bold; }
+.macd-tag   { background-color: #2c1654; color: #c39bd3; padding: 2px 7px; border-radius: 4px; font-size: 0.78rem; font-weight: bold; border: 1px solid #8e44ad; }
+.bigmove-tag { background-color: #3d2208; color: #f5b041; padding: 2px 7px; border-radius: 4px; font-size: 0.78rem; font-weight: bold; border: 1px solid #f39c12; }
+.shortmove-tag { background-color: #3d0808; color: #ff7675; padding: 2px 7px; border-radius: 4px; font-size: 0.78rem; font-weight: bold; border: 1px solid #c0392b; }
+
+/* Spot signal labels */
+.spot-tag-whale-buy   { background: #003d1f; color: #00ff88; padding: 3px 10px; border-radius: 4px; font-weight: bold; border: 1px solid #00b894; font-size: 0.88rem; }
+.spot-tag-whale-sell  { background: #3d0000; color: #ff7675; padding: 3px 10px; border-radius: 4px; font-weight: bold; border: 1px solid #d63031; font-size: 0.88rem; }
+.spot-tag-surge-buy   { background: #1a3a00; color: #a3cb38; padding: 3px 10px; border-radius: 4px; font-weight: bold; border: 1px solid #6ab04c; font-size: 0.88rem; }
+.spot-tag-surge-sell  { background: #3a1a00; color: #fd9644; padding: 3px 10px; border-radius: 4px; font-weight: bold; border: 1px solid #e55039; font-size: 0.88rem; }
+.spot-tag-spot-buy    { background: #0a2a1a; color: #55efc4; padding: 3px 10px; border-radius: 4px; font-weight: bold; border: 1px solid #00b894; font-size: 0.88rem; }
+.spot-tag-spot-sell   { background: #2a0a0a; color: #ff7675; padding: 3px 10px; border-radius: 4px; font-weight: bold; border: 1px solid #d63031; font-size: 0.88rem; }
+.spot-tag-large-buy   { background: #0a1a2a; color: #74b9ff; padding: 3px 10px; border-radius: 4px; font-weight: bold; border: 1px solid #0984e3; font-size: 0.88rem; }
+.spot-tag-large-sell  { background: #2a1a0a; color: #fdcb6e; padding: 3px 10px; border-radius: 4px; font-weight: bold; border: 1px solid #e17055; font-size: 0.88rem; }
+
+/* Stat cards */
+.stat-card { background-color: #1e2127; padding: 10px; border-radius: 10px; margin-bottom: 10px; border-left: 5px solid #f1c40f; }
+.debug-box { background-color: #1a1a2e; border: 1px solid #333; border-radius: 8px; padding: 10px; font-family: monospace; font-size: 0.75rem; color: #aaa; max-height: 200px; overflow-y: auto; }
+
+/* Tables */
+table { width: 100%; border-collapse: collapse; }
+th, td { white-space: nowrap; padding: 12px 15px; text-align: left; border-bottom: 1px solid #222; }
+.sym-link { color: #f1c40f; text-decoration: none; font-weight: bold; font-size: 1.05rem; }
+.sym-link:hover { color: #fff; }
+.sym-link-spot { color: #74b9ff; text-decoration: none; font-weight: bold; font-size: 1.05rem; }
+.sym-link-spot:hover { color: #fff; }
+.green-arrow { color: #00ff88; font-weight: bold; }
+.red-arrow   { color: #ff4b4b; font-weight: bold; }
+.row-flash-pump { background-color: rgba(0, 255, 136, 0.22) !important; border-left: 5px solid #00ff88 !important; }
+.row-flash-dump { background-color: rgba(255, 75,  75,  0.22) !important; border-left: 5px solid #ff4b4b !important; }
+.row-conf-pump  { background-color: rgba(0, 255, 136, 0.08) !important; }
+.row-conf-dump  { background-color: rgba(255, 75,  75,  0.08) !important; }
+.row-macd       { background-color: rgba(142, 68, 173, 0.12) !important; border-left: 3px solid #8e44ad !important; }
+.row-bigmove    { background-color: rgba(243, 156, 18, 0.15) !important; border-left: 4px solid #f39c12 !important; }
+.row-shortmove  { background-color: rgba(192, 57, 43, 0.18) !important; border-left: 4px solid #c0392b !important; }
+.row-spot-buy   { background-color: rgba(0, 184, 148, 0.10) !important; border-left: 4px solid #00b894 !important; }
+.row-spot-sell  { background-color: rgba(214, 48, 49, 0.12) !important; border-left: 4px solid #d63031 !important; }
+.row-spot-whale-buy  { background-color: rgba(0, 255, 136, 0.18) !important; border-left: 5px solid #00ff88 !important; }
+.row-spot-whale-sell { background-color: rgba(255, 75, 75, 0.22) !important; border-left: 5px solid #ff4b4b !important; }
+.row-spot-neutral { background-color: rgba(116, 185, 255, 0.08) !important; border-left: 3px solid #0984e3 !important; }
+
+/* MACD radar */
+.macd-radar-card { background: #1a1030; border: 1px solid #8e44ad; border-radius: 8px; padding: 8px 12px; margin-bottom: 6px; }
+.macd-radar-sym { color: #c39bd3; font-weight: bold; font-size: 1rem; }
+.macd-radar-tag { color: #f0c3ff; font-size: 0.82rem; }
+.macd-radar-time { color: #666; font-size: 0.72rem; }
+
+/* BigMove radar */
+.bigmove-card { background: #2a1d0a; border: 1px solid #f39c12; border-radius: 8px; padding: 10px 14px; margin-bottom: 8px; }
+.bigmove-sym { color: #f5b041; font-weight: bold; font-size: 1.1rem; }
+.bigmove-cond { color: #f8c471; font-size: 0.85rem; }
+.bigmove-score { color: #fff; font-weight: bold; font-size: 0.9rem; }
+.bigmove-time { color: #888; font-size: 0.72rem; }
+.bigmove-radar-card { background: #1a1508; border: 1px solid #7f8c8d; border-radius: 8px; padding: 8px 12px; margin-bottom: 6px; }
+.bigmove-radar-sym { color: #d5dbdb; font-weight: bold; font-size: 1rem; }
+.bigmove-radar-cond { color: #aab7b8; font-size: 0.82rem; }
+
+/* ShortMove radar */
+.shortmove-card { background: #1f0a0a; border: 1px solid #c0392b; border-radius: 8px; padding: 10px 14px; margin-bottom: 8px; }
+.shortmove-sym { color: #ff7675; font-weight: bold; font-size: 1.1rem; }
+.shortmove-cond { color: #fab1a0; font-size: 0.85rem; }
+.shortmove-radar-card { background: #1a0a08; border: 1px solid #7f3030; border-radius: 8px; padding: 8px 12px; margin-bottom: 6px; }
+.shortmove-radar-sym { color: #e17055; font-weight: bold; font-size: 1rem; }
+.shortmove-radar-cond { color: #d63031; font-size: 0.82rem; }
+
+/* Spot stat card */
+.spot-stat-buy  { background: #0a1a12; border: 1px solid #00b894; border-radius: 8px; padding: 8px 12px; margin-bottom: 6px; }
+.spot-stat-sell { background: #1a0a0a; border: 1px solid #d63031; border-radius: 8px; padding: 8px 12px; margin-bottom: 6px; }
+.spot-whale-badge { background: #003d1f; color: #00ff88; padding: 2px 8px; border-radius: 10px; font-size: 0.75rem; font-weight: bold; border: 1px solid #00b894; }
+
+/* Progress bar */
+.pressure-bar-container { display: flex; height: 8px; border-radius: 4px; overflow: hidden; width: 100%; min-width: 80px; }
+.pressure-buy  { background: #00b894; height: 100%; }
+.pressure-sell { background: #d63031; height: 100%; }
+</style>
 """, unsafe_allow_html=True)
 
 radar = get_radar_instance()
-if "thread_started" not in st.session_state:
+
+# Thread yönetimi
+if "futures_thread_started" not in st.session_state:
     t = threading.Thread(target=binance_worker, args=(radar,), daemon=True)
     t.start()
-    st.session_state.thread_started = True
-    radar.log(">>> UI: Thread baslatildi")
+    st.session_state.futures_thread_started = True
+    radar.log(">>> UI: Futures thread baslatildi")
 
-# ==================== NAVIGATION ====================
-st.sidebar.title("Navigation")
-page = st.sidebar.radio(
-    "Sayfa Sec",
-    ["📡 Normal Sinyaller", "🚀 Long Big Move Hunter", "🔻 Short Big Move Hunter"],
-    index=0,
-)
-st.sidebar.markdown("---")
-st.sidebar.caption("v3.0 | Market Radar Pro")
+if "spot_thread_started" not in st.session_state:
+    t2 = threading.Thread(target=spot_worker, args=(radar,), daemon=True)
+    t2.start()
+    st.session_state.spot_thread_started = True
+    radar.log(">>> UI: Spot thread baslatildi")
 
-# Header ortak
-h1, h2, h3, h4, h5 = st.columns([2, 1, 1, 1, 1])
+# ==================== SAYFA NAVİGASYONU ====================
+# query_params ile sayfa takibi (üst üste binmez)
+params = st.query_params
+current_page = params.get("page", "futures")
+
+pages = {
+    "futures":  ("📡 Futures Sinyaller", "active-futures"),
+    "longbig":  ("🚀 Long Big Move",     "active-longbig"),
+    "shortbig": ("🔻 Short Big Move",    "active-shortbig"),
+    "spot":     ("💱 Spot Alım/Satım",   "active-spot"),
+}
+
+nav_html = "<div class='page-nav-container'>"
+for key, (label, active_cls) in pages.items():
+    cls = f"page-btn {active_cls}" if key == current_page else "page-btn"
+    nav_html += f'<a href="?page={key}" class="{cls}">{label}</a>'
+nav_html += "</div>"
+st.markdown(nav_html, unsafe_allow_html=True)
+
+# ==================== ORTAK HEADER ====================
+h1, h2, h3, h4, h5, h6 = st.columns([2, 1, 1, 1, 1, 1])
 h1.title("📡 Market Radar Pro")
 
-elapsed = time.time() - radar.last_heartbeat
-status_html = (
-    '<span class="status-live">● SYSTEM LIVE</span>'
-    if elapsed < 10
-    else '<span class="status-offline">● RECONNECTING</span>'
-)
+f_elapsed = time.time() - radar.last_heartbeat
+s_elapsed = time.time() - radar.spot_last_heartbeat
+futures_ok = f_elapsed < 10
+spot_ok = s_elapsed < 15
+
+status_html = ""
+if futures_ok:
+    status_html += '<span class="status-live">● FUTURES LIVE</span> '
+else:
+    status_html += '<span class="status-offline">● FUTURES OFF</span> '
+if spot_ok:
+    status_html += '<span class="status-live">● SPOT LIVE</span>'
+else:
+    status_html += '<span class="status-offline">● SPOT OFF</span>'
+
 h2.markdown(f"<div style='margin-top:10px;'>{status_html}</div>", unsafe_allow_html=True)
-h2.markdown(
-    '<a href="https://x.com/SinyalEngineer" target="_blank" style="color:white; text-decoration:none;">𝕏 @SinyalEngineer</a>',
-    unsafe_allow_html=True,
-)
-h3.metric("Pairs Tracked", radar.total_pairs)
-h3.metric("Total Signals", len(radar.signals))
-h4.metric("Long Big Moves", len(radar.bigmove_signals))
+h2.markdown('<a href="https://x.com/SinyalEngineer" target="_blank" style="color:white; text-decoration:none;">𝕏 @SinyalEngineer</a>', unsafe_allow_html=True)
+h3.metric("Futures Pairs", radar.total_pairs)
+h3.metric("Spot Pairs", radar.spot_total_pairs)
+h4.metric("Futures Sinyaller", len(radar.signals))
+h5.metric("Long Big Moves", len(radar.bigmove_signals))
 h5.metric("Short Big Moves", len(radar.shortmove_signals))
+h6.metric("Spot Sinyaller", len(radar.spot_signals))
 
 st.divider()
 
-# DEBUG PANEL (ortak)
 with st.expander("🔧 Debug Log", expanded=False):
     with radar.lock:
         logs = list(radar.debug_log)
@@ -1018,10 +1284,10 @@ with st.expander("🔧 Debug Log", expanded=False):
 st.divider()
 
 # ================================================================
-# SAYFA 1: NORMAL SINYALLER
+# SAYFA 1: FUTURES SİNYALLER
 # ================================================================
-if page == "📡 Normal Sinyaller":
-    h1.caption("⚡ Flash: Anlık hareket | 💎 Confirmed: 3dk+15dk | 📊 MACD: Paralel yukselis (3-8 mum)")
+if current_page == "futures":
+    st.caption("⚡ Flash: Anlık hareket | 💎 Confirmed: 3dk+15dk | 📊 MACD: Paralel yükseliş (3-8 mum)")
 
     col_filters = st.columns([1, 1, 1, 1])
     mode_filter = col_filters[0].multiselect(
@@ -1031,13 +1297,13 @@ if page == "📡 Normal Sinyaller":
         key="mode_filter"
     )
     pd_filter = col_filters[1].multiselect(
-        "Yon",
+        "Yön",
         ["PUMP", "BUY", "DUMP", "SELL"],
         default=["PUMP", "BUY", "DUMP", "SELL"],
         key="pd_filter"
     )
-    search_query = col_filters[2].text_input("🔍 Symbol Filter", placeholder="BTC...", key="search").upper()
-    macd_only = col_filters[3].checkbox("Sadece MACD etiketli sinyaller", value=False)
+    search_query = col_filters[2].text_input("🔍 Symbol Filtrele", placeholder="BTC...", key="search").upper()
+    macd_only = col_filters[3].checkbox("Sadece MACD etiketli", value=False)
 
     st.divider()
 
@@ -1056,38 +1322,28 @@ if page == "📡 Normal Sinyaller":
         macd_placeholder = st.empty()
 
     def get_mode_css_class(mode):
-        if "CONFIRMED" in mode:
-            return "mode-confirmed"
-        if "MACD" in mode:
-            return "mode-macd"
+        if "CONFIRMED" in mode: return "mode-confirmed"
+        if "MACD" in mode: return "mode-macd"
         return "mode-flash"
 
     def label_css(s_type):
-        mapping = {
-            "PUMP": "pump-label",
-            "DUMP": "dump-label",
-            "BUY": "buy-label",
-            "SELL": "sell-label",
-        }
-        return mapping.get(s_type, "buy-label")
+        return {"PUMP": "pump-label", "DUMP": "dump-label", "BUY": "buy-label", "SELL": "sell-label"}.get(s_type, "buy-label")
 
     def row_css(s_type, mode):
-        if "MACD" in mode:
-            return "row-macd"
+        if "MACD" in mode: return "row-macd"
         is_up = s_type in ("PUMP", "BUY")
-        if "FLASH" in mode:
-            return "row-flash-pump" if is_up else "row-flash-dump"
+        if "FLASH" in mode: return "row-flash-pump" if is_up else "row-flash-dump"
         return "row-conf-pump" if is_up else "row-conf-dump"
 
-    def render_table(display_data, placeholder):
+    def render_futures_table(display_data, placeholder):
         with placeholder.container():
             with radar.lock:
                 if display_data:
                     html = (
                         "<table><tr>"
-                        "<th>Time</th><th>Symbol (4H ↑/↓)</th><th>Price</th>"
+                        "<th>Saat</th><th>Symbol (4H ↑/↓)</th><th>Fiyat</th>"
                         "<th>Momentum</th><th>15m Ref</th><th>Vol</th>"
-                        "<th>Status</th><th>Type</th><th>MACD Pattern</th>"
+                        "<th>Durum</th><th>Tür</th><th>MACD Pattern</th>"
                         "</tr>"
                     )
                     for row in display_data:
@@ -1102,7 +1358,6 @@ if page == "📡 Normal Sinyaller":
                         macd_html = f"<span class='macd-tag'>{macd_val}</span>" if macd_val else "—"
                         vol_display = f"{row['Vol'] / 1000:.0f}k" if row['Vol'] > 0 else "—"
                         ref_display = f"{row['Ref']:+.4f}" if row['Ref'] != 0 else "—"
-
                         html += (
                             f"<tr class='{r_cls}'>"
                             f"<td>{row['Time']}</td>"
@@ -1121,7 +1376,7 @@ if page == "📡 Normal Sinyaller":
                     html += "</table>"
                     st.markdown(html, unsafe_allow_html=True)
                 else:
-                    st.info("Sinyal araniyor... Market taraniyor 🔍")
+                    st.info("Sinyal aranıyor... Market taranıyor 🔍")
 
     while True:
         with side_placeholder.container():
@@ -1154,39 +1409,34 @@ if page == "📡 Normal Sinyaller":
         if macd_only:
             display_data = [s for s in display_data if s.get('MACD')]
 
-        render_table(display_data, main_placeholder)
+        render_futures_table(display_data, main_placeholder)
 
         with macd_placeholder.container():
             with radar.lock:
                 candidates = dict(radar.macd_candidates)
-
             if candidates:
                 def _macd_sort_key(item):
                     tag = item[1].get("MACD Pattern", "Paralel(0)")
-                    try:
-                        return int(tag.split("(")[1].rstrip(")"))
-                    except:
-                        return 0
-
+                    try: return int(tag.split("(")[1].rstrip(")"))
+                    except: return 0
                 sorted_c = sorted(candidates.items(), key=_macd_sort_key, reverse=True)
                 for sym, info in sorted_c[:20]:
                     tv_url = f"https://www.tradingview.com/chart/?symbol=BINANCE:{sym}USDT.P"
                     st.markdown(f"""<div class="macd-radar-card">
                         <a href="{tv_url}" target="_blank" class="macd-radar-sym">{sym}</a><br>
                         <span class="macd-radar-tag">{info["MACD Pattern"]}</span>
-                        &nbsp;
-                        <span style="color:#aaa;font-size:0.8rem">{info["Fiyat"]}</span><br>
-                   <span class="macd-radar-time">{info.get("Guncelleme", "N/A")}</span>
+                        &nbsp;<span style="color:#aaa;font-size:0.8rem">{info["Fiyat"]}</span><br>
+                        <span class="macd-radar-time">{info.get("Güncelleme", "N/A")}</span>
                     </div>""", unsafe_allow_html=True)
             else:
-                st.caption("MACD taraniyor...")
+                st.caption("MACD taranıyor...")
 
         time.sleep(1.5)
 
 # ================================================================
 # SAYFA 2: LONG BIG MOVE HUNTER
 # ================================================================
-elif page == "🚀 Long Big Move Hunter":
+elif current_page == "longbig":
     st.caption("🎯 Bollinger Squeeze + 4H MA200 Break + 1H MACD Resistance Break")
 
     st.markdown("""
@@ -1204,16 +1454,14 @@ elif page == "🚀 Long Big Move Hunter":
     col_f1, col_f2, col_f3 = st.columns([1, 1, 1])
     bm_search = col_f1.text_input("🔍 Symbol Ara", placeholder="BTC...", key="bm_search").upper()
     min_score = col_f2.slider("Min Skor", 0, 100, 50)
-    show_radar_only = col_f3.checkbox("Sadece Squeeze Radar (henüz breakout olmamış)", value=False)
+    show_radar_only = col_f3.checkbox("Sadece Squeeze Radar", value=False)
 
     st.divider()
 
     col_bm_main, col_bm_radar = st.columns([3, 1])
-
     with col_bm_main:
         st.subheader("🚀 Long Big Move Sinyalleri")
         bm_main_placeholder = st.empty()
-
     with col_bm_radar:
         st.subheader("🔍 Squeeze Radar")
         bm_radar_placeholder = st.empty()
@@ -1224,15 +1472,14 @@ elif page == "🚀 Long Big Move Hunter":
                 if data:
                     html = (
                         "<table><tr>"
-                        "<th>Time</th><th>Symbol</th><th>Price</th>"
-                        "<th>Skor</th><th>Kosullar</th><th>MA200 Mesafe</th><th>MACD 1H</th>"
+                        "<th>Saat</th><th>Symbol</th><th>Fiyat</th>"
+                        "<th>Skor</th><th>Koşullar</th><th>MA200 Mesafe</th><th>MACD 1H</th>"
                         "</tr>"
                     )
                     for row in data:
                         sym = row['Symbol']
                         tv_url = f"https://www.tradingview.com/chart/?symbol=BINANCE:{sym}USDT.P"
                         score_color = "#00ff88" if row['Score'] >= 70 else "#f39c12" if row['Score'] >= 50 else "#e74c3c"
-
                         html += (
                             f"<tr class='row-bigmove'>"
                             f"<td>{row['Time']}</td>"
@@ -1258,52 +1505,44 @@ elif page == "🚀 Long Big Move Hunter":
         if bm_search:
             display_bm = [s for s in display_bm if bm_search in s['Symbol']]
         display_bm = [s for s in display_bm if s['Score'] >= min_score]
-
         if show_radar_only:
             display_bm = []
 
         render_bigmove_table(display_bm, bm_main_placeholder)
 
         with bm_radar_placeholder.container():
-            radar_items = []
-            if bm_candidates:
-                for sym, info in bm_candidates.items():
-                    if bm_search and bm_search not in sym:
-                        continue
-                    radar_items.append((sym, info))
-
+            radar_items = [(sym, info) for sym, info in bm_candidates.items()
+                           if not bm_search or bm_search in sym]
             radar_items.sort(key=lambda x: x[1].get('Score', 0), reverse=True)
-
             if radar_items:
                 for sym, info in radar_items[:15]:
                     tv_url = f"https://www.tradingview.com/chart/?symbol=BINANCE:{sym}USDT.P"
                     st.markdown(f"""<div class="bigmove-radar-card">
                         <a href="{tv_url}" target="_blank" class="bigmove-radar-sym">{sym}</a><br>
                         <span class="bigmove-radar-cond">{info["Conditions"]}</span><br>
-                        <span style="color:#888; font-size:0.8rem;">Skor: <b>{info["Score"]}</b> | BB-Poz: {info["BB_Pos"]} | {info["Time"]}</span>
+                        <span style="color:#888;font-size:0.8rem;">Skor: <b>{info["Score"]}</b> | BB-Poz: {info["BB_Pos"]} | {info["Time"]}</span>
                     </div>""", unsafe_allow_html=True)
             else:
-                st.caption("Squeeze taraniyor...")
+                st.caption("Squeeze taranıyor...")
 
         time.sleep(2)
 
 # ================================================================
 # SAYFA 3: SHORT BIG MOVE HUNTER
 # ================================================================
-else:
+elif current_page == "shortbig":
     st.caption("🔻 MA200 Breakdown + Death Cross + RSI Bearish Div + BB Upper Rejection + MACD Bear")
 
     st.markdown("""
     <div style="background-color:#1f0a0a; border-left:4px solid #c0392b; padding:12px 16px; border-radius:4px; margin-bottom:16px;">
         <b style="color:#ff7675;">Short Big Move Hunter Nasıl Çalışır?</b><br>
         <span style="color:#d5dbdb; font-size:0.9rem;">
-        1. <b>MA200 Breakdown:</b> 4H fiyat 20+ mum MA200 üstünde kaldıktan sonra altına kırılıyor mu? (35 puan, tek başına yeterli)<br>
+        1. <b>MA200 Breakdown:</b> 4H fiyat 20+ mum MA200 üstünde kaldıktan sonra altına kırılıyor mu? (35 puan)<br>
         2. <b>Death Cross:</b> 4H 50MA, 200MA'nın altına geçiyor mu? (30 puan)<br>
         3. <b>RSI Overbought + Bearish Divergence:</b> 1H RSI &gt;70 VE/VEYA fiyat yüksek ama RSI düşüyor (15–30 puan)<br>
-        4. <b>BB Upper Rejection:</b> 4H Bollinger üst bantından fiyat reddediliyor, bearish mum oluşuyor (20 puan)<br>
-        5. <b>MACD 1H Bearish:</b> 1H MACD sinyal çizgisinin altına geçiyor, histogram negatife dönüyor (25 puan)<br>
-        <br>
-        <b>Sinyal için:</b> En az 2 koşul birleşmeli + toplam skor ≥ 50. MA200 Breakdown tek başına yeterlidir.
+        4. <b>BB Upper Rejection:</b> 4H Bollinger üst bantından fiyat reddediliyor (20 puan)<br>
+        5. <b>MACD 1H Bearish:</b> 1H MACD sinyal çizgisinin altına geçiyor (25 puan)<br>
+        En az 2 koşul + skor ≥ 50. MA200 Breakdown tek başına yeterlidir.
         </span>
     </div>
     """, unsafe_allow_html=True)
@@ -1311,16 +1550,14 @@ else:
     col_f1, col_f2, col_f3 = st.columns([1, 1, 1])
     sm_search = col_f1.text_input("🔍 Symbol Ara", placeholder="BTC...", key="sm_search").upper()
     sm_min_score = col_f2.slider("Min Skor", 0, 100, 50, key="sm_score")
-    sm_show_radar = col_f3.checkbox("Sadece Short Radar (henüz breakout olmamış)", value=False)
+    sm_show_radar = col_f3.checkbox("Sadece Short Radar", value=False)
 
     st.divider()
 
     col_sm_main, col_sm_radar = st.columns([3, 1])
-
     with col_sm_main:
         st.subheader("🔻 Short Big Move Sinyalleri")
         sm_main_placeholder = st.empty()
-
     with col_sm_radar:
         st.subheader("👁 Short Radar")
         sm_radar_placeholder = st.empty()
@@ -1330,15 +1567,14 @@ else:
             if data:
                 html = (
                     "<table><tr>"
-                    "<th>Time</th><th>Symbol</th><th>Price</th>"
-                    "<th>Skor</th><th>Kosullar</th><th>MA200 Mesafe</th><th>RSI</th><th>MACD 1H</th>"
+                    "<th>Saat</th><th>Symbol</th><th>Fiyat</th>"
+                    "<th>Skor</th><th>Koşullar</th><th>MA200 Mesafe</th><th>RSI</th><th>MACD 1H</th>"
                     "</tr>"
                 )
                 for row in data:
                     sym = row['Symbol']
                     tv_url = f"https://www.tradingview.com/chart/?symbol=BINANCE:{sym}USDT.P"
                     score_color = "#ff4b4b" if row['Score'] >= 70 else "#e17055" if row['Score'] >= 50 else "#e74c3c"
-
                     html += (
                         f"<tr class='row-shortmove'>"
                         f"<td>{row['Time']}</td>"
@@ -1361,40 +1597,233 @@ else:
             sm_signals = list(radar.shortmove_signals)
             sm_candidates = dict(radar.shortmove_candidates)
 
-        display_sm = sm_signals
-        if sm_search:
-            display_sm = [s for s in display_sm if sm_search in s['Symbol']]
-        display_sm = [s for s in display_sm if s['Score'] >= sm_min_score]
-
+        display_sm = [s for s in sm_signals
+                      if (not sm_search or sm_search in s['Symbol'])
+                      and s['Score'] >= sm_min_score]
         if sm_show_radar:
             display_sm = []
 
         render_shortmove_table(display_sm, sm_main_placeholder)
 
         with sm_radar_placeholder.container():
-            sm_radar_items = []
-            if sm_candidates:
-                for sym, info in sm_candidates.items():
-                    if sm_search and sm_search not in sym:
-                        continue
-                    sm_radar_items.append((sym, info))
-
+            sm_radar_items = [(sym, info) for sym, info in sm_candidates.items()
+                              if not sm_search or sm_search in sym]
             sm_radar_items.sort(key=lambda x: x[1].get('Score', 0), reverse=True)
-
             if sm_radar_items:
                 for sym, info in sm_radar_items[:15]:
                     tv_url = f"https://www.tradingview.com/chart/?symbol=BINANCE:{sym}USDT.P"
                     st.markdown(f"""<div class="shortmove-radar-card">
                         <a href="{tv_url}" target="_blank" class="shortmove-radar-sym">{sym}</a><br>
                         <span class="shortmove-radar-cond">{info["Conditions"]}</span><br>
-                        <span style="color:#888; font-size:0.8rem;">
-                            Skor: <b>{info["Score"]}</b> | 
-                            BB-Poz: {info.get("BB_Pos","—")} | 
-                            RSI: {info.get("RSI","—")} | 
-                            {info["Time"]}
+                        <span style="color:#888;font-size:0.8rem;">
+                            Skor: <b>{info["Score"]}</b> | BB-Poz: {info.get("BB_Pos","—")} |
+                            RSI: {info.get("RSI","—")} | {info["Time"]}
                         </span>
                     </div>""", unsafe_allow_html=True)
             else:
-                st.caption("Short fırsatları taraniyor...")
+                st.caption("Short fırsatları taranıyor...")
+
+        time.sleep(2)
+
+# ================================================================
+# SAYFA 4: SPOT ALIM/SATIM
+# ================================================================
+elif current_page == "spot":
+    st.caption("💱 Binance Spot | Büyük işlemler, balina hareketleri, agresif alım/satım baskısı")
+
+    st.markdown("""
+    <div style="background-color:#0a1a2a; border-left:4px solid #0984e3; padding:12px 16px; border-radius:4px; margin-bottom:16px;">
+        <b style="color:#74b9ff;">Spot Tracker Nasıl Çalışır?</b><br>
+        <span style="color:#d5dbdb; font-size:0.9rem;">
+        🐋 <b>Whale:</b> $200K+ tek işlem + %2 fiyat değişimi — Büyük oyuncu hareketi<br>
+        🔥 <b>Surge:</b> %5+ fiyat değişimi — Güçlü momentum<br>
+        📈 <b>Spot Buy/Sell:</b> %2-5 fiyat değişimi — Orta güçlü hareket<br>
+        💰 <b>Large:</b> Büyük işlem hacmi + belirgin alım/satım baskısı<br>
+        <b>Alım/Satım Baskısı:</b> Son 50 işlemdeki agresif alım (taker buy) vs satım oranı
+        </span>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # Filtreler
+    spot_col1, spot_col2, spot_col3, spot_col4 = st.columns([1, 1, 1, 1])
+    spot_search = spot_col1.text_input("🔍 Symbol Ara", placeholder="BTC...", key="spot_search").upper()
+    spot_dir = spot_col2.multiselect(
+        "Yön",
+        ["BUY", "SELL", "NEUTRAL"],
+        default=["BUY", "SELL", "NEUTRAL"],
+        key="spot_dir"
+    )
+    whale_only = spot_col3.checkbox("🐋 Sadece Whale", value=False)
+    min_chg_spot = spot_col4.slider("Min Değişim %", 0.0, 10.0, 0.0, step=0.5, key="spot_minchg")
+
+    st.divider()
+
+    # Ana layout
+    col_spot_stats, col_spot_main = st.columns([1, 4])
+
+    with col_spot_stats:
+        st.subheader("📊 Spot Özet")
+        spot_stats_placeholder = st.empty()
+
+    with col_spot_main:
+        st.subheader("💱 Spot Sinyaller")
+        spot_main_placeholder = st.empty()
+
+    def get_spot_row_class(signal_color):
+        mapping = {
+            "whale-buy":  "row-spot-whale-buy",
+            "whale-sell": "row-spot-whale-sell",
+            "surge-buy":  "row-spot-buy",
+            "surge-sell": "row-spot-sell",
+            "spot-buy":   "row-spot-buy",
+            "spot-sell":  "row-spot-sell",
+            "large-buy":  "row-spot-buy",
+            "large-sell": "row-spot-sell",
+        }
+        return mapping.get(signal_color, "row-spot-neutral")
+
+    def format_usd(val):
+        if val >= 1_000_000:
+            return f"${val/1_000_000:.1f}M"
+        if val >= 1_000:
+            return f"${val/1_000:.0f}K"
+        return f"${val:.0f}"
+
+    def render_spot_table(data, placeholder):
+        with placeholder.container():
+            if data:
+                html = (
+                    "<table><tr>"
+                    "<th>Saat</th>"
+                    "<th>Symbol</th>"
+                    "<th>Fiyat</th>"
+                    "<th>24H Değ.</th>"
+                    "<th>Sinyal</th>"
+                    "<th>Alım/Satım Baskısı</th>"
+                    "<th>Büyük İşlem</th>"
+                    "<th>Hacim</th>"
+                    "</tr>"
+                )
+                for row in data:
+                    sym = row['Symbol']
+                    tv_url = f"https://www.tradingview.com/chart/?symbol=BINANCE:{sym}USDT"
+                    r_cls = get_spot_row_class(row['SignalColor'])
+                    tag_cls = f"spot-tag-{row['SignalColor']}"
+
+                    chg = row['Chg']
+                    chg_color = "#00ff88" if chg > 0 else "#ff4b4b"
+                    chg_str = f"<span style='color:{chg_color}; font-weight:bold;'>{chg:+.2f}%</span>"
+
+                    buy_r = row['BuyRatio']
+                    sell_r = row['SellRatio']
+                    pressure_html = (
+                        f"<div style='display:flex; align-items:center; gap:6px;'>"
+                        f"<span style='color:#00b894; font-size:0.78rem;'>B{buy_r:.0f}%</span>"
+                        f"<div class='pressure-bar-container' style='width:70px;'>"
+                        f"<div class='pressure-buy' style='width:{buy_r}%;'></div>"
+                        f"<div class='pressure-sell' style='width:{sell_r}%;'></div>"
+                        f"</div>"
+                        f"<span style='color:#d63031; font-size:0.78rem;'>S{sell_r:.0f}%</span>"
+                        f"</div>"
+                    )
+
+                    whale_html = ""
+                    if row['WhaleUSD'] > 0:
+                        whale_html = (
+                            f"<span class='spot-whale-badge'>🐋 {format_usd(row['WhaleUSD'])}</span>"
+                            if row['HasWhale']
+                            else format_usd(row['WhaleUSD'])
+                        )
+                    else:
+                        whale_html = "—"
+
+                    vol_str = format_usd(row['QuoteVol'])
+
+                    html += (
+                        f"<tr class='{r_cls}'>"
+                        f"<td style='color:#888; font-size:0.85rem;'>{row['Time']}</td>"
+                        f"<td><a href='{tv_url}' target='_blank' class='sym-link-spot'>{sym}</a></td>"
+                        f"<td style='font-family:monospace;'>{row['Price']}</td>"
+                        f"<td>{chg_str}</td>"
+                        f"<td><span class='{tag_cls}'>{row['SignalType']}</span></td>"
+                        f"<td>{pressure_html}</td>"
+                        f"<td>{whale_html}</td>"
+                        f"<td style='color:#888;'>{vol_str}</td>"
+                        f"</tr>"
+                    )
+                html += "</table>"
+                st.markdown(html, unsafe_allow_html=True)
+            else:
+                st.info("Spot sinyali bekleniyor... Piyasa taranıyor 💱")
+
+    while True:
+        with radar.lock:
+            spot_sigs = list(radar.spot_signals)
+
+        # Filtrele
+        display_spot = spot_sigs
+        if spot_search:
+            display_spot = [s for s in display_spot if spot_search in s['Symbol']]
+        if spot_dir:
+            display_spot = [s for s in display_spot if s['DominantSide'] in spot_dir]
+        if whale_only:
+            display_spot = [s for s in display_spot if s['HasWhale']]
+        if min_chg_spot > 0:
+            display_spot = [s for s in display_spot if abs(s['Chg']) >= min_chg_spot]
+
+        render_spot_table(display_spot, spot_main_placeholder)
+
+        # İstatistik paneli
+        with spot_stats_placeholder.container():
+            total = len(spot_sigs)
+            whales = sum(1 for s in spot_sigs if s['HasWhale'])
+            buys = sum(1 for s in spot_sigs if s['DominantSide'] == 'BUY')
+            sells = sum(1 for s in spot_sigs if s['DominantSide'] == 'SELL')
+
+            st.markdown(f"""
+            <div style="background:#0a1a2a; border:1px solid #0984e3; border-radius:8px; padding:12px; margin-bottom:10px;">
+                <div style="color:#74b9ff; font-weight:bold; margin-bottom:8px;">📊 Son Sinyaller</div>
+                <div style="display:flex; justify-content:space-between; margin-bottom:4px;">
+                    <span style="color:#aaa;">Toplam</span>
+                    <span style="color:#fff; font-weight:bold;">{total}</span>
+                </div>
+                <div style="display:flex; justify-content:space-between; margin-bottom:4px;">
+                    <span style="color:#00ff88;">🐋 Whale</span>
+                    <span style="color:#00ff88; font-weight:bold;">{whales}</span>
+                </div>
+                <div style="display:flex; justify-content:space-between; margin-bottom:4px;">
+                    <span style="color:#00b894;">📈 Alım</span>
+                    <span style="color:#00b894; font-weight:bold;">{buys}</span>
+                </div>
+                <div style="display:flex; justify-content:space-between;">
+                    <span style="color:#d63031;">📉 Satım</span>
+                    <span style="color:#d63031; font-weight:bold;">{sells}</span>
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+
+            # Top aktif semboller (spot'ta)
+            sym_counts = {}
+            for s in spot_sigs[:50]:
+                sym = s['Symbol']
+                sym_counts[sym] = sym_counts.get(sym, 0) + 1
+            top_syms = sorted(sym_counts.items(), key=lambda x: x[1], reverse=True)[:8]
+
+            if top_syms:
+                st.markdown("<div style='color:#74b9ff; font-weight:bold; margin-bottom:6px; margin-top:12px;'>🔥 Aktif Semboller</div>", unsafe_allow_html=True)
+                for sym, cnt in top_syms:
+                    tv_url = f"https://www.tradingview.com/chart/?symbol=BINANCE:{sym}USDT"
+                    # Bu sembol alım mı satım mı ağırlıklı?
+                    sym_sigs = [s for s in spot_sigs[:50] if s['Symbol'] == sym]
+                    sym_buys = sum(1 for s in sym_sigs if s['DominantSide'] == 'BUY')
+                    sym_sells = len(sym_sigs) - sym_buys
+                    trend_color = "#00b894" if sym_buys >= sym_sells else "#d63031"
+                    trend_icon = "↑" if sym_buys >= sym_sells else "↓"
+                    st.markdown(f"""
+                    <div style="background:#0d1520; border:1px solid #1a3a5c; border-radius:6px; padding:6px 10px; margin-bottom:4px;">
+                        <a href="{tv_url}" target="_blank" class="sym-link-spot">{sym}</a>
+                        <span style="float:right; color:{trend_color}; font-weight:bold;">{trend_icon} {cnt}x</span>
+                    </div>
+                    """, unsafe_allow_html=True)
 
         time.sleep(2)

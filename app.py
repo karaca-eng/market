@@ -42,14 +42,16 @@ DEATH_CROSS_MA_FAST = 50
 DEATH_CROSS_MA_SLOW = 200
 BB_UPPER_REJECTION_BARS = 3
 
-# SPOT AYARLARI
-SPOT_EXECUTOR = ThreadPoolExecutor(max_workers=10)
-SPOT_FETCH_INTERVAL = 5
-SPOT_MIN_VOL = 20000
-SPOT_LARGE_TRADE_USD = 50000
-SPOT_WHALE_TRADE_USD = 200000
-SPOT_COOLDOWN = 30
-MAX_SPOT_SIGNALS = 200
+# SPOT AYARLARI - SADECE BALINA FOKUSLU
+SPOT_EXECUTOR = ThreadPoolExecutor(max_workers=15)
+SPOT_FETCH_INTERVAL = 3
+SPOT_MIN_VOL = 500000
+SPOT_LARGE_TRADE_USD = 100000
+SPOT_WHALE_TRADE_USD = 300000
+SPOT_MEGA_WHALE_USD = 1000000
+SPOT_COOLDOWN = 60
+MAX_SPOT_SIGNALS = 100
+SPOT_MAX_INTERESTING = 50
 
 BINANCE_REST_URLS = [
     "https://fapi.binance.com",
@@ -57,10 +59,13 @@ BINANCE_REST_URLS = [
     "https://fapi2.binance.com",
 ]
 
+# Spot için sağlıklı URL listesi (futures gibi)
 BINANCE_SPOT_URLS = [
     "https://api.binance.com",
     "https://api1.binance.com",
     "https://api2.binance.com",
+    "https://api3.binance.com",
+    "https://api4.binance.com",
 ]
 
 # ==================== HELPERS ====================
@@ -106,13 +111,15 @@ class MarketRadar:
         self.shortmove_candidates = {}
         self.shortmove_last_trigger = {}
 
-        # SPOT state
+        # SPOT state - Balina fokuslu
         self.spot_signals = []
         self.spot_last_trade_id = {}
         self.spot_last_fetch = {}
         self.spot_price_cache = {}
         self.spot_last_heartbeat = 0
         self.spot_total_pairs = 0
+        self.spot_failed_urls = set()
+        self.spot_url_fail_count = {}
 
     def log(self, msg):
         t = datetime.now().strftime("%H:%M:%S")
@@ -136,7 +143,9 @@ class MarketRadar:
         self.log("🔴 Hiçbir Futures URL'e bağlanılamadı!")
         return self.rest_base_url
 
+    # ==================== SPOT BAĞLANTI YÖNETİMİ (FUTURES GİBİ) ====================
     def get_working_spot_url(self):
+        """Futures gibi çalışan, sağlıklı spot URL bulucu"""
         for url in BINANCE_SPOT_URLS:
             try:
                 r = requests.get(f"{url}/api/v3/ping", timeout=3)
@@ -148,6 +157,31 @@ class MarketRadar:
                 self.log(f"❌ Spot {url} → HATA: {e}")
         self.log("🔴 Hiçbir Spot URL'e bağlanılamadı!")
         return self.spot_base_url
+
+    def _spot_request(self, endpoint, timeout=5):
+        """Spot istekleri için otomatik failover (futures gibi)"""
+        urls_to_try = [self.spot_base_url] + [u for u in BINANCE_SPOT_URLS if u != self.spot_base_url]
+        last_error = None
+        for url in urls_to_try:
+            try:
+                full_url = f"{url}{endpoint}"
+                r = requests.get(full_url, timeout=timeout, headers=self.headers)
+                if r.status_code == 200:
+                    if url != self.spot_base_url:
+                        self.spot_base_url = url
+                        self.log(f"🔄 Spot URL değişti: {url}")
+                    return r.json()
+                elif r.status_code == 429:
+                    self.log(f"⚠️ Spot rate limit: {url}")
+                    time.sleep(1)
+                else:
+                    self.log(f"⚠️ Spot HTTP {r.status_code}: {url}")
+            except Exception as e:
+                last_error = e
+                self.log(f"❌ Spot {url} → {e}")
+                continue
+        self.log(f"🔴 Tüm Spot URL'ler başarısız! Son hata: {last_error}")
+        return None
 
     def check_resets(self):
         now = datetime.now()
@@ -263,33 +297,25 @@ class MarketRadar:
                 self.signals.pop()
 
     # ================================================================
-    # SPOT İŞLEMLERİ
+    # SPOT İŞLEMLERİ - SADECE BALINA FOKUSLU
     # ================================================================
 
     def fetch_spot_ticker(self):
-        """Spot piyasasındaki tüm USDT çiftlerini çek"""
-        try:
-            url = f"{self.spot_base_url}/api/v3/ticker/24hr"
-            r = requests.get(url, timeout=5, headers=self.headers)
-            if r.status_code == 200:
-                return r.json()
-        except Exception as e:
-            self.log(f"❌ Spot ticker hata: {e}")
-        return []
+        """Spot piyasasındaki tüm USDT çiftlerini çek - failover destekli"""
+        data = self._spot_request("/api/v3/ticker/24hr", timeout=8)
+        if data is None:
+            return []
+        return data
 
-    def fetch_spot_recent_trades(self, symbol, limit=20):
-        """Belirli bir spot sembol için son işlemleri çek"""
-        try:
-            url = f"{self.spot_base_url}/api/v3/trades?symbol={symbol}&limit={limit}"
-            r = requests.get(url, timeout=3, headers=self.headers)
-            if r.status_code == 200:
-                return r.json()
-        except:
-            pass
-        return []
+    def fetch_spot_recent_trades(self, symbol, limit=100):
+        """Belirli bir spot sembol için son işlemleri çek - failover destekli"""
+        data = self._spot_request(f"/api/v3/trades?symbol={symbol}&limit={limit}", timeout=5)
+        if data is None:
+            return []
+        return data
 
     def process_spot_ticker(self, data):
-        """Spot ticker verilerini işle, büyük hacimli hareketleri tespit et"""
+        """Spot ticker verilerini işle - sadece balina potansiyeli olan semboller"""
         now = time.time()
         interesting = []
 
@@ -301,28 +327,24 @@ class MarketRadar:
                 price = float(item['lastPrice'])
                 chg_pct = float(item['priceChangePercent'])
                 quote_vol = float(item['quoteVolume'])
-                trades_count = int(item['count'])
-                high = float(item['highPrice'])
-                low = float(item['lowPrice'])
-                bid = float(item.get('bidPrice', price))
-                ask = float(item.get('askPrice', price))
-                spread_pct = ((ask - bid) / price * 100) if price > 0 else 0
 
-                # Filtrele: düşük hacimli atla
+                # Düşük hacimli atla
                 if quote_vol < SPOT_MIN_VOL:
                     continue
 
-                # İlginç durumlar
-                if abs(chg_pct) >= 2.0 or quote_vol >= 5_000_000:
+                # Sadece ilginç durumlar: yüksek hacim VEYA büyük değişim
+                is_interesting = (
+                    abs(chg_pct) >= 3.0 or
+                    quote_vol >= 10_000_000 or
+                    (abs(chg_pct) >= 1.5 and quote_vol >= 2_000_000)
+                )
+
+                if is_interesting:
                     interesting.append({
                         'symbol': symbol,
                         'price': price,
                         'chg_pct': chg_pct,
                         'quote_vol': quote_vol,
-                        'trades_count': trades_count,
-                        'high': high,
-                        'low': low,
-                        'spread_pct': spread_pct,
                     })
             except:
                 continue
@@ -331,13 +353,13 @@ class MarketRadar:
             self.spot_last_heartbeat = now
             self.spot_total_pairs = len([x for x in data if x.get('symbol', '').endswith('USDT')])
 
-        # En ilginç 30 sembolü işle
-        interesting.sort(key=lambda x: abs(x['chg_pct']), reverse=True)
-        for item in interesting[:30]:
-            SPOT_EXECUTOR.submit(self._analyze_spot_symbol, item, now)
+        # En ilginç sembolleri sırala ve işle
+        interesting.sort(key=lambda x: x['quote_vol'], reverse=True)
+        for item in interesting[:SPOT_MAX_INTERESTING]:
+            SPOT_EXECUTOR.submit(self._analyze_spot_whale, item, now)
 
-    def _analyze_spot_symbol(self, item, now):
-        """Spot sembol için detaylı analiz + son büyük işlemler"""
+    def _analyze_spot_whale(self, item, now):
+        """Spot sembol için balina analizi - sadece büyük işlemler"""
         symbol = item['symbol']
         sym_clean = symbol.replace("USDT", "")
         price = item['price']
@@ -351,16 +373,18 @@ class MarketRadar:
                 return
             self.spot_last_fetch[sym_clean] = now
 
-        # Son işlemleri çek
-        trades = self.fetch_spot_recent_trades(symbol, limit=50)
+        # Son işlemleri çek (daha fazla veri = daha iyi balina tespiti)
+        trades = self.fetch_spot_recent_trades(symbol, limit=100)
         if not trades:
             return
 
-        # Büyük işlemleri bul
+        # Balina işlemlerini analiz et
+        whale_trades = []
         large_trades = []
         buy_vol = 0.0
         sell_vol = 0.0
         total_usd = 0.0
+        last_trade_id = None
 
         for t in trades:
             try:
@@ -370,6 +394,10 @@ class MarketRadar:
                 is_buyer_maker = t.get('isBuyerMaker', False)
                 # isBuyerMaker=True → satıcı agresif (SELL), False → alıcı agresif (BUY)
                 side = "SELL" if is_buyer_maker else "BUY"
+                trade_id = t.get('id', 0)
+
+                if last_trade_id is None or trade_id > last_trade_id:
+                    last_trade_id = trade_id
 
                 if side == "BUY":
                     buy_vol += usd_val
@@ -377,7 +405,15 @@ class MarketRadar:
                     sell_vol += usd_val
                 total_usd += usd_val
 
-                if usd_val >= SPOT_LARGE_TRADE_USD:
+                if usd_val >= SPOT_WHALE_TRADE_USD:
+                    whale_trades.append({
+                        'usd': usd_val,
+                        'qty': qty,
+                        'price': trade_price,
+                        'side': side,
+                        'time': t.get('time', 0),
+                    })
+                elif usd_val >= SPOT_LARGE_TRADE_USD:
                     large_trades.append({
                         'usd': usd_val,
                         'qty': qty,
@@ -388,40 +424,68 @@ class MarketRadar:
             except:
                 continue
 
-        if not large_trades and abs(chg_pct) < 3.0:
+        # Sadece balina varsa veya çok büyük hacim varsa sinyal üret
+        has_whale = len(whale_trades) > 0
+        has_large = len(large_trades) >= 3
+
+        if not has_whale and not has_large and abs(chg_pct) < 5.0:
             return
 
         # Alım/satım baskısı
         total_vol = buy_vol + sell_vol
         buy_ratio = buy_vol / total_vol if total_vol > 0 else 0.5
+        sell_ratio = 1 - buy_ratio
 
-        # Sinyal tipi belirle
-        has_whale = any(t['usd'] >= SPOT_WHALE_TRADE_USD for t in large_trades)
-        dominant_side = "BUY" if buy_ratio >= 0.6 else "SELL" if buy_ratio <= 0.4 else "NEUTRAL"
+        # Dominant side
+        if buy_ratio >= 0.65:
+            dominant_side = "BUY"
+        elif sell_ratio >= 0.65:
+            dominant_side = "SELL"
+        else:
+            dominant_side = "NEUTRAL"
 
-        # Etiket
-        if has_whale and abs(chg_pct) >= 2.0:
-            if chg_pct > 0:
+        # En büyük balina işlemi
+        top_whale = max(whale_trades, key=lambda x: x['usd']) if whale_trades else None
+        top_large = max(large_trades, key=lambda x: x['usd']) if large_trades else None
+        max_trade_usd = top_whale['usd'] if top_whale else (top_large['usd'] if top_large else 0)
+
+        # Sinyal tipi belirle - sadece balina odaklı
+        is_mega = any(t['usd'] >= SPOT_MEGA_WHALE_USD for t in whale_trades)
+
+        if is_mega:
+            if dominant_side == "BUY":
+                signal_type = "🐋 MEGA WHALE BUY"
+                signal_color = "mega-whale-buy"
+            elif dominant_side == "SELL":
+                signal_type = "🐋 MEGA WHALE SELL"
+                signal_color = "mega-whale-sell"
+            else:
+                signal_type = "🐋 MEGA WHALE"
+                signal_color = "mega-whale-buy" if chg_pct > 0 else "mega-whale-sell"
+        elif has_whale:
+            if dominant_side == "BUY":
                 signal_type = "🐋 WHALE BUY"
                 signal_color = "whale-buy"
-            else:
+            elif dominant_side == "SELL":
                 signal_type = "🐋 WHALE SELL"
                 signal_color = "whale-sell"
-        elif abs(chg_pct) >= 5.0:
-            signal_type = "🔥 SURGE BUY" if chg_pct > 0 else "💥 SURGE SELL"
-            signal_color = "surge-buy" if chg_pct > 0 else "surge-sell"
-        elif abs(chg_pct) >= 2.0:
-            signal_type = "📈 SPOT BUY" if chg_pct > 0 else "📉 SPOT SELL"
-            signal_color = "spot-buy" if chg_pct > 0 else "spot-sell"
-        elif large_trades:
-            signal_type = "💰 LARGE BUY" if dominant_side == "BUY" else "💰 LARGE SELL"
-            signal_color = "large-buy" if dominant_side == "BUY" else "large-sell"
+            else:
+                signal_type = "🐋 WHALE"
+                signal_color = "whale-buy" if chg_pct > 0 else "whale-sell"
+        elif has_large and abs(chg_pct) >= 3.0:
+            if dominant_side == "BUY":
+                signal_type = "💰 LARGE BUY"
+                signal_color = "large-buy"
+            elif dominant_side == "SELL":
+                signal_type = "💰 LARGE SELL"
+                signal_color = "large-sell"
+            else:
+                signal_type = "💰 LARGE"
+                signal_color = "large-buy" if chg_pct > 0 else "large-sell"
         else:
             return
 
         t_str = datetime.now().strftime("%H:%M:%S")
-        top_trade = max(large_trades, key=lambda x: x['usd']) if large_trades else None
-        whale_usd = top_trade['usd'] if top_trade else 0
 
         with self.lock:
             # Duplikat kontrol
@@ -436,15 +500,21 @@ class MarketRadar:
                 "Chg": chg_pct,
                 "QuoteVol": quote_vol,
                 "BuyRatio": round(buy_ratio * 100, 1),
-                "SellRatio": round((1 - buy_ratio) * 100, 1),
-                "LargeTrades": len(large_trades),
-                "WhaleUSD": whale_usd,
+                "SellRatio": round(sell_ratio * 100, 1),
+                "WhaleCount": len(whale_trades),
+                "LargeCount": len(large_trades),
+                "MaxTradeUSD": max_trade_usd,
                 "SignalType": signal_type,
                 "SignalColor": signal_color,
                 "HasWhale": has_whale,
+                "HasMega": is_mega,
                 "DominantSide": dominant_side,
+                "TotalTradesAnalyzed": len(trades),
             })
-            self.log(f"💱 SPOT: {sym_clean} {signal_type} {chg_pct:+.2f}% | Whale: ${whale_usd:,.0f}")
+            self.log(f"💱 SPOT WHALE: {sym_clean} {signal_type} | "
+                      f"Max: ${max_trade_usd:,.0f} | "
+                      f"Whale: {len(whale_trades)} | "
+                      f"Buy: {buy_ratio*100:.0f}%")
             if len(self.spot_signals) > MAX_SPOT_SIGNALS:
                 self.spot_signals.pop()
 
@@ -1075,12 +1145,16 @@ def spot_worker(radar_obj):
                 if fetch_count % 5 == 0:
                     radar_obj.log(
                         f"💱 Spot Fetch #{fetch_count} | Pairs: {radar_obj.spot_total_pairs} | "
-                        f"Spot Signals: {len(radar_obj.spot_signals)}"
+                        f"Spot Signals: {len(radar_obj.spot_signals)} | "
+                        f"URL: {radar_obj.spot_base_url}"
                     )
             else:
-                radar_obj.log("⚠️ Spot veri alınamadı")
+                radar_obj.log("⚠️ Spot veri alınamadı - URL yeniden kontrol ediliyor...")
+                radar_obj.get_working_spot_url()
         except Exception as e:
             radar_obj.log(f"❌ SPOT WORKER HATA: {e}")
+            time.sleep(2)
+            radar_obj.get_working_spot_url()
         time.sleep(SPOT_FETCH_INTERVAL)
 
 
@@ -1136,13 +1210,11 @@ st.markdown("""
 .bigmove-tag { background-color: #3d2208; color: #f5b041; padding: 2px 7px; border-radius: 4px; font-size: 0.78rem; font-weight: bold; border: 1px solid #f39c12; }
 .shortmove-tag { background-color: #3d0808; color: #ff7675; padding: 2px 7px; border-radius: 4px; font-size: 0.78rem; font-weight: bold; border: 1px solid #c0392b; }
 
-/* Spot signal labels */
+/* Spot signal labels - SADECE BALINA */
+.spot-tag-mega-whale-buy   { background: #004d26; color: #00ff88; padding: 3px 10px; border-radius: 4px; font-weight: bold; border: 2px solid #00ff88; font-size: 0.9rem; }
+.spot-tag-mega-whale-sell  { background: #4d0000; color: #ff7675; padding: 3px 10px; border-radius: 4px; font-weight: bold; border: 2px solid #ff4b4b; font-size: 0.9rem; }
 .spot-tag-whale-buy   { background: #003d1f; color: #00ff88; padding: 3px 10px; border-radius: 4px; font-weight: bold; border: 1px solid #00b894; font-size: 0.88rem; }
 .spot-tag-whale-sell  { background: #3d0000; color: #ff7675; padding: 3px 10px; border-radius: 4px; font-weight: bold; border: 1px solid #d63031; font-size: 0.88rem; }
-.spot-tag-surge-buy   { background: #1a3a00; color: #a3cb38; padding: 3px 10px; border-radius: 4px; font-weight: bold; border: 1px solid #6ab04c; font-size: 0.88rem; }
-.spot-tag-surge-sell  { background: #3a1a00; color: #fd9644; padding: 3px 10px; border-radius: 4px; font-weight: bold; border: 1px solid #e55039; font-size: 0.88rem; }
-.spot-tag-spot-buy    { background: #0a2a1a; color: #55efc4; padding: 3px 10px; border-radius: 4px; font-weight: bold; border: 1px solid #00b894; font-size: 0.88rem; }
-.spot-tag-spot-sell   { background: #2a0a0a; color: #ff7675; padding: 3px 10px; border-radius: 4px; font-weight: bold; border: 1px solid #d63031; font-size: 0.88rem; }
 .spot-tag-large-buy   { background: #0a1a2a; color: #74b9ff; padding: 3px 10px; border-radius: 4px; font-weight: bold; border: 1px solid #0984e3; font-size: 0.88rem; }
 .spot-tag-large-sell  { background: #2a1a0a; color: #fdcb6e; padding: 3px 10px; border-radius: 4px; font-weight: bold; border: 1px solid #e17055; font-size: 0.88rem; }
 
@@ -1166,11 +1238,14 @@ th, td { white-space: nowrap; padding: 12px 15px; text-align: left; border-botto
 .row-macd       { background-color: rgba(142, 68, 173, 0.12) !important; border-left: 3px solid #8e44ad !important; }
 .row-bigmove    { background-color: rgba(243, 156, 18, 0.15) !important; border-left: 4px solid #f39c12 !important; }
 .row-shortmove  { background-color: rgba(192, 57, 43, 0.18) !important; border-left: 4px solid #c0392b !important; }
-.row-spot-buy   { background-color: rgba(0, 184, 148, 0.10) !important; border-left: 4px solid #00b894 !important; }
-.row-spot-sell  { background-color: rgba(214, 48, 49, 0.12) !important; border-left: 4px solid #d63031 !important; }
-.row-spot-whale-buy  { background-color: rgba(0, 255, 136, 0.18) !important; border-left: 5px solid #00ff88 !important; }
-.row-spot-whale-sell { background-color: rgba(255, 75, 75, 0.22) !important; border-left: 5px solid #ff4b4b !important; }
-.row-spot-neutral { background-color: rgba(116, 185, 255, 0.08) !important; border-left: 3px solid #0984e3 !important; }
+
+/* Spot rows - balina odaklı */
+.row-spot-mega-whale-buy  { background-color: rgba(0, 255, 136, 0.28) !important; border-left: 6px solid #00ff88 !important; }
+.row-spot-mega-whale-sell { background-color: rgba(255, 75, 75, 0.30) !important; border-left: 6px solid #ff4b4b !important; }
+.row-spot-whale-buy       { background-color: rgba(0, 255, 136, 0.18) !important; border-left: 5px solid #00ff88 !important; }
+.row-spot-whale-sell      { background-color: rgba(255, 75, 75, 0.22) !important; border-left: 5px solid #ff4b4b !important; }
+.row-spot-large-buy       { background-color: rgba(0, 184, 148, 0.10) !important; border-left: 4px solid #00b894 !important; }
+.row-spot-large-sell      { background-color: rgba(214, 48, 49, 0.12) !important; border-left: 4px solid #d63031 !important; }
 
 /* MACD radar */
 .macd-radar-card { background: #1a1030; border: 1px solid #8e44ad; border-radius: 8px; padding: 8px 12px; margin-bottom: 6px; }
@@ -1197,9 +1272,8 @@ th, td { white-space: nowrap; padding: 12px 15px; text-align: left; border-botto
 .shortmove-radar-cond { color: #d63031; font-size: 0.82rem; }
 
 /* Spot stat card */
-.spot-stat-buy  { background: #0a1a12; border: 1px solid #00b894; border-radius: 8px; padding: 8px 12px; margin-bottom: 6px; }
-.spot-stat-sell { background: #1a0a0a; border: 1px solid #d63031; border-radius: 8px; padding: 8px 12px; margin-bottom: 6px; }
 .spot-whale-badge { background: #003d1f; color: #00ff88; padding: 2px 8px; border-radius: 10px; font-size: 0.75rem; font-weight: bold; border: 1px solid #00b894; }
+.spot-mega-badge { background: #004d26; color: #00ff88; padding: 2px 8px; border-radius: 10px; font-size: 0.8rem; font-weight: bold; border: 2px solid #00ff88; }
 
 /* Progress bar */
 .pressure-bar-container { display: flex; height: 8px; border-radius: 4px; overflow: hidden; width: 100%; min-width: 80px; }
@@ -1224,7 +1298,6 @@ if "spot_thread_started" not in st.session_state:
     radar.log(">>> UI: Spot thread baslatildi")
 
 # ==================== SAYFA NAVİGASYONU ====================
-# query_params ile sayfa takibi (üst üste binmez)
 params = st.query_params
 current_page = params.get("page", "futures")
 
@@ -1232,7 +1305,7 @@ pages = {
     "futures":  ("📡 Futures Sinyaller", "active-futures"),
     "longbig":  ("🚀 Long Big Move",     "active-longbig"),
     "shortbig": ("🔻 Short Big Move",    "active-shortbig"),
-    "spot":     ("💱 Spot Alım/Satım",   "active-spot"),
+    "spot":     ("🐋 Spot Whale Tracker",   "active-spot"),
 }
 
 nav_cols = st.columns(len(pages))
@@ -1292,7 +1365,7 @@ h3.metric("Spot Pairs", radar.spot_total_pairs)
 h4.metric("Futures Sinyaller", len(radar.signals))
 h5.metric("Long Big Moves", len(radar.bigmove_signals))
 h5.metric("Short Big Moves", len(radar.shortmove_signals))
-h6.metric("Spot Sinyaller", len(radar.spot_signals))
+h6.metric("Spot Whale Sinyaller", len(radar.spot_signals))
 
 st.divider()
 
@@ -1650,20 +1723,20 @@ elif current_page == "shortbig":
         time.sleep(2)
 
 # ================================================================
-# SAYFA 4: SPOT ALIM/SATIM
+# SAYFA 4: SPOT WHALE TRACKER - SADECE BALINA
 # ================================================================
 elif current_page == "spot":
-    st.caption("💱 Binance Spot | Büyük işlemler, balina hareketleri, agresif alım/satım baskısı")
+    st.caption("🐋 Binance Spot | Sadece Balina İşlemleri | $100K+ Large | $300K+ Whale | $1M+ Mega Whale")
 
     st.markdown("""
     <div style="background-color:#0a1a2a; border-left:4px solid #0984e3; padding:12px 16px; border-radius:4px; margin-bottom:16px;">
-        <b style="color:#74b9ff;">Spot Tracker Nasıl Çalışır?</b><br>
+        <b style="color:#74b9ff;">Spot Whale Tracker Nasıl Çalışır?</b><br>
         <span style="color:#d5dbdb; font-size:0.9rem;">
-        🐋 <b>Whale:</b> $200K+ tek işlem + %2 fiyat değişimi — Büyük oyuncu hareketi<br>
-        🔥 <b>Surge:</b> %5+ fiyat değişimi — Güçlü momentum<br>
-        📈 <b>Spot Buy/Sell:</b> %2-5 fiyat değişimi — Orta güçlü hareket<br>
-        💰 <b>Large:</b> Büyük işlem hacmi + belirgin alım/satım baskısı<br>
-        <b>Alım/Satım Baskısı:</b> Son 50 işlemdeki agresif alım (taker buy) vs satım oranı
+        🐋 <b>Mega Whale:</b> $1M+ tek işlem — En büyük oyuncuların hareketi<br>
+        🐋 <b>Whale:</b> $300K+ tek işlem — Büyük oyuncu hareketi<br>
+        💰 <b>Large:</b> $100K+ işlemler + %3+ fiyat değişimi — Orta-büyük hareket<br>
+        <b>Alım/Satım Baskısı:</b> Son 100 işlemdeki agresif alım (taker buy) vs satım oranı<br>
+        <b>Not:</b> Sadece balina işlemi olan semboller gösterilir. Düşük hacimli/ufak işlemler filtrelenir.
         </span>
     </div>
     """, unsafe_allow_html=True)
@@ -1673,13 +1746,15 @@ elif current_page == "spot":
     spot_search = spot_col1.text_input("🔍 Symbol Ara", placeholder="BTC...", key="spot_search").upper()
     spot_type_filter = spot_col2.multiselect(
         "Sinyal Tipi",
-        ["🐋 WHALE BUY", "🐋 WHALE SELL", "🔥 SURGE BUY", "💥 SURGE SELL",
-         "📈 SPOT BUY", "📉 SPOT SELL", "💰 LARGE BUY", "💰 LARGE SELL"],
-        default=["🐋 WHALE BUY", "🐋 WHALE SELL", "🔥 SURGE BUY", "💥 SURGE SELL",
-                 "📈 SPOT BUY", "📉 SPOT SELL", "💰 LARGE BUY", "💰 LARGE SELL"],
+        ["🐋 MEGA WHALE BUY", "🐋 MEGA WHALE SELL", "🐋 MEGA WHALE",
+         "🐋 WHALE BUY", "🐋 WHALE SELL", "🐋 WHALE",
+         "💰 LARGE BUY", "💰 LARGE SELL", "💰 LARGE"],
+        default=["🐋 MEGA WHALE BUY", "🐋 MEGA WHALE SELL", "🐋 MEGA WHALE",
+                 "🐋 WHALE BUY", "🐋 WHALE SELL", "🐋 WHALE",
+                 "💰 LARGE BUY", "💰 LARGE SELL", "💰 LARGE"],
         key="spot_type"
     )
-    whale_only = spot_col3.checkbox("🐋 Sadece Whale", value=False)
+    whale_only = spot_col3.checkbox("🐋 Sadece Whale/Mega", value=False)
 
     st.divider()
 
@@ -1687,23 +1762,21 @@ elif current_page == "spot":
     col_spot_stats, col_spot_main = st.columns([1, 4])
 
     with col_spot_stats:
-        st.subheader("📊 Spot Özet")
+        st.subheader("📊 Whale Özeti")
         spot_stats_placeholder = st.empty()
 
     with col_spot_main:
-        st.subheader("💱 Spot Sinyaller")
+        st.subheader("🐋 Spot Whale Sinyaller")
         spot_main_placeholder = st.empty()
 
     def get_spot_row_class(signal_color):
         mapping = {
-            "whale-buy":  "row-spot-whale-buy",
-            "whale-sell": "row-spot-whale-sell",
-            "surge-buy":  "row-spot-buy",
-            "surge-sell": "row-spot-sell",
-            "spot-buy":   "row-spot-buy",
-            "spot-sell":  "row-spot-sell",
-            "large-buy":  "row-spot-buy",
-            "large-sell": "row-spot-sell",
+            "mega-whale-buy":  "row-spot-mega-whale-buy",
+            "mega-whale-sell": "row-spot-mega-whale-sell",
+            "whale-buy":       "row-spot-whale-buy",
+            "whale-sell":      "row-spot-whale-sell",
+            "large-buy":       "row-spot-large-buy",
+            "large-sell":      "row-spot-large-sell",
         }
         return mapping.get(signal_color, "row-spot-neutral")
 
@@ -1724,7 +1797,9 @@ elif current_page == "spot":
                     "<th>Fiyat</th>"
                     "<th>24H Değ.</th>"
                     "<th>Sinyal</th>"
-                    "<th>Büyük İşlem</th>"
+                    "<th>Max İşlem</th>"
+                    "<th>Balina Sayısı</th>"
+                    "<th>Alım/Satım</th>"
                     "<th>Hacim</th>"
                     "</tr>"
                 )
@@ -1738,15 +1813,27 @@ elif current_page == "spot":
                     chg_color = "#00ff88" if chg > 0 else "#ff4b4b"
                     chg_str = f"<span style='color:{chg_color}; font-weight:bold;'>{chg:+.2f}%</span>"
 
-                    whale_html = ""
-                    if row['WhaleUSD'] > 0:
-                        whale_html = (
-                            f"<span class='spot-whale-badge'>🐋 {format_usd(row['WhaleUSD'])}</span>"
-                            if row['HasWhale']
-                            else format_usd(row['WhaleUSD'])
-                        )
+                    max_trade = row['MaxTradeUSD']
+                    if row['HasMega']:
+                        max_html = f"<span class='spot-mega-badge'>🐋 {format_usd(max_trade)}</span>"
+                    elif row['HasWhale']:
+                        max_html = f"<span class='spot-whale-badge'>🐋 {format_usd(max_trade)}</span>"
                     else:
-                        whale_html = "—"
+                        max_html = format_usd(max_trade)
+
+                    whale_count = row['WhaleCount']
+                    large_count = row['LargeCount']
+
+                    buy_ratio = row['BuyRatio']
+                    sell_ratio = row['SellRatio']
+                    pressure_html = (
+                        f"<div class='pressure-bar-container'>"
+                        f"<div class='pressure-buy' style='width:{buy_ratio}%;'></div>"
+                        f"<div class='pressure-sell' style='width:{sell_ratio}%;'></div>"
+                        f"</div>"
+                        f"<small style='color:#00b894;'>{buy_ratio:.0f}%</small> / "
+                        f"<small style='color:#d63031;'>{sell_ratio:.0f}%</small>"
+                    )
 
                     vol_str = format_usd(row['QuoteVol'])
 
@@ -1757,14 +1844,16 @@ elif current_page == "spot":
                         f"<td style='font-family:monospace;'>{row['Price']}</td>"
                         f"<td>{chg_str}</td>"
                         f"<td><span class='{tag_cls}'>{row['SignalType']}</span></td>"
-                        f"<td>{whale_html}</td>"
+                        f"<td>{max_html}</td>"
+                        f"<td style='text-align:center;'><b style='color:#f1c40f;'>{whale_count}</b> / <span style='color:#888;'>{large_count}</span></td>"
+                        f"<td>{pressure_html}</td>"
                         f"<td style='color:#888;'>{vol_str}</td>"
                         f"</tr>"
                     )
                 html += "</table>"
                 st.markdown(html, unsafe_allow_html=True)
             else:
-                st.info("Spot sinyali bekleniyor... Piyasa taranıyor 💱")
+                st.info("Balina sinyali bekleniyor... Spot piyasa taranıyor 🐋")
 
     while True:
         with radar.lock:
@@ -1777,40 +1866,50 @@ elif current_page == "spot":
         if spot_type_filter:
             display_spot = [s for s in display_spot if s['SignalType'] in spot_type_filter]
         if whale_only:
-            display_spot = [s for s in display_spot if s['HasWhale']]
+            display_spot = [s for s in display_spot if s['HasWhale'] or s['HasMega']]
 
         render_spot_table(display_spot, spot_main_placeholder)
 
         # İstatistik paneli
         with spot_stats_placeholder.container():
             total = len(spot_sigs)
-            whales = sum(1 for s in spot_sigs if s['HasWhale'])
+            mega = sum(1 for s in spot_sigs if s['HasMega'])
+            whales = sum(1 for s in spot_sigs if s['HasWhale'] and not s['HasMega'])
+            large = sum(1 for s in spot_sigs if not s['HasWhale'] and not s['HasMega'])
             buys = sum(1 for s in spot_sigs if s['DominantSide'] == 'BUY')
             sells = sum(1 for s in spot_sigs if s['DominantSide'] == 'SELL')
 
             st.markdown(f"""
             <div style="background:#0a1a2a; border:1px solid #0984e3; border-radius:8px; padding:12px; margin-bottom:10px;">
-                <div style="color:#74b9ff; font-weight:bold; margin-bottom:8px;">📊 Son Sinyaller</div>
+                <div style="color:#74b9ff; font-weight:bold; margin-bottom:8px;">📊 Whale Özeti</div>
                 <div style="display:flex; justify-content:space-between; margin-bottom:4px;">
-                    <span style="color:#aaa;">Toplam</span>
+                    <span style="color:#aaa;">Toplam Sinyal</span>
                     <span style="color:#fff; font-weight:bold;">{total}</span>
                 </div>
                 <div style="display:flex; justify-content:space-between; margin-bottom:4px;">
-                    <span style="color:#00ff88;">🐋 Whale</span>
-                    <span style="color:#00ff88; font-weight:bold;">{whales}</span>
+                    <span style="color:#00ff88;">🐋 Mega Whale</span>
+                    <span style="color:#00ff88; font-weight:bold;">{mega}</span>
                 </div>
                 <div style="display:flex; justify-content:space-between; margin-bottom:4px;">
-                    <span style="color:#00b894;">📈 Alım</span>
+                    <span style="color:#00b894;">🐋 Whale</span>
+                    <span style="color:#00b894; font-weight:bold;">{whales}</span>
+                </div>
+                <div style="display:flex; justify-content:space-between; margin-bottom:4px;">
+                    <span style="color:#74b9ff;">💰 Large</span>
+                    <span style="color:#74b9ff; font-weight:bold;">{large}</span>
+                </div>
+                <div style="display:flex; justify-content:space-between; margin-bottom:4px;">
+                    <span style="color:#00b894;">📈 Alım Ağırlıklı</span>
                     <span style="color:#00b894; font-weight:bold;">{buys}</span>
                 </div>
                 <div style="display:flex; justify-content:space-between;">
-                    <span style="color:#d63031;">📉 Satım</span>
+                    <span style="color:#d63031;">📉 Satım Ağırlıklı</span>
                     <span style="color:#d63031; font-weight:bold;">{sells}</span>
                 </div>
             </div>
             """, unsafe_allow_html=True)
 
-            # Top aktif semboller (spot'ta)
+            # Top aktif semboller (spot whale'ta)
             sym_counts = {}
             for s in spot_sigs[:50]:
                 sym = s['Symbol']
@@ -1818,15 +1917,15 @@ elif current_page == "spot":
             top_syms = sorted(sym_counts.items(), key=lambda x: x[1], reverse=True)[:8]
 
             if top_syms:
-                st.markdown("<div style='color:#74b9ff; font-weight:bold; margin-bottom:6px; margin-top:12px;'>🔥 Aktif Semboller</div>", unsafe_allow_html=True)
+                st.markdown("<div style='color:#74b9ff; font-weight:bold; margin-bottom:6px; margin-top:12px;'>🔥 En Aktif Semboller</div>", unsafe_allow_html=True)
                 for sym, cnt in top_syms:
                     tv_url = f"https://www.tradingview.com/chart/?symbol=BINANCE:{sym}USDT"
-                    # Bu sembol alım mı satım mı ağırlıklı?
                     sym_sigs = [s for s in spot_sigs[:50] if s['Symbol'] == sym]
                     sym_buys = sum(1 for s in sym_sigs if s['DominantSide'] == 'BUY')
                     sym_sells = len(sym_sigs) - sym_buys
-                    trend_color = "#00b894" if sym_buys >= sym_sells else "#d63031"
-                    trend_icon = "↑" if sym_buys >= sym_sells else "↓"
+                    has_mega = any(s['HasMega'] for s in sym_sigs)
+                    trend_color = "#00ff88" if has_mega else ("#00b894" if sym_buys >= sym_sells else "#d63031")
+                    trend_icon = "🐋" if has_mega else ("↑" if sym_buys >= sym_sells else "↓")
                     st.markdown(f"""
                     <div style="background:#0d1520; border:1px solid #1a3a5c; border-radius:6px; padding:6px 10px; margin-bottom:4px;">
                         <a href="{tv_url}" target="_blank" class="sym-link-spot">{sym}</a>

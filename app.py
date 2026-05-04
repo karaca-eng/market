@@ -45,10 +45,10 @@ BB_UPPER_REJECTION_BARS = 3
 # SPOT AYARLARI - SADECE BALINA FOKUSLU
 SPOT_EXECUTOR = ThreadPoolExecutor(max_workers=15)
 SPOT_FETCH_INTERVAL = 3
-SPOT_MIN_VOL = 50000
-SPOT_LARGE_TRADE_USD = 10000
-SPOT_WHALE_TRADE_USD = 30000
-SPOT_MEGA_WHALE_USD = 100000
+SPOT_MIN_VOL = 500000
+SPOT_LARGE_TRADE_USD = 100000
+SPOT_WHALE_TRADE_USD = 300000
+SPOT_MEGA_WHALE_USD = 1000000
 SPOT_COOLDOWN = 60
 MAX_SPOT_SIGNALS = 100
 SPOT_MAX_INTERESTING = 50
@@ -1548,9 +1548,9 @@ elif current_page == "longbig":
     </div>
     """, unsafe_allow_html=True)
 
-    col_f1, col_f2, col_f3 = st.columns([1, 1, 1])
+    col_f1, col_f3 = st.columns([1, 1])
     bm_search = col_f1.text_input("🔍 Symbol Ara", placeholder="BTC...", key="bm_search").upper()
-    min_score = col_f2.slider("Min Skor", 0, 100, 50)
+    min_score = 70  # Sabit minimum skor
     show_radar_only = col_f3.checkbox("Sadece Squeeze Radar", value=False)
 
     st.divider()
@@ -1644,9 +1644,9 @@ elif current_page == "shortbig":
     </div>
     """, unsafe_allow_html=True)
 
-    col_f1, col_f2, col_f3 = st.columns([1, 1, 1])
+    col_f1, col_f3 = st.columns([1, 1])
     sm_search = col_f1.text_input("🔍 Symbol Ara", placeholder="BTC...", key="sm_search").upper()
-    sm_min_score = col_f2.slider("Min Skor", 0, 100, 50, key="sm_score")
+    sm_min_score = 70  # Sabit minimum skor
     sm_show_radar = col_f3.checkbox("Sadece Short Radar", value=False)
 
     st.divider()

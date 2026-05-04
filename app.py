@@ -1235,12 +1235,36 @@ pages = {
     "spot":     ("💱 Spot Alım/Satım",   "active-spot"),
 }
 
-nav_html = "<div class='page-nav-container'>"
-for key, (label, active_cls) in pages.items():
-    cls = f"page-btn {active_cls}" if key == current_page else "page-btn"
-    nav_html += f'<a href="?page={key}" class="{cls}">{label}</a>'
-nav_html += "</div>"
-st.markdown(nav_html, unsafe_allow_html=True)
+nav_cols = st.columns(len(pages))
+for i, (key, (label, active_cls)) in enumerate(pages.items()):
+    is_active = key == current_page
+    border_colors = {
+        "futures": "#00ff88", "longbig": "#f39c12",
+        "shortbig": "#c0392b", "spot": "#0984e3",
+    }
+    bg_colors = {
+        "futures": "#1a3a1a", "longbig": "#2a1d08",
+        "shortbig": "#2a0808", "spot": "#0a1a2a",
+    }
+    text_colors = {
+        "futures": "#00ff88", "longbig": "#f5b041",
+        "shortbig": "#ff7675", "spot": "#74b9ff",
+    }
+    if is_active:
+        style = (
+            f"background:{bg_colors[key]}; color:{text_colors[key]}; "
+            f"border:2px solid {border_colors[key]}; border-radius:8px; "
+            f"padding:8px 0; font-weight:bold; font-size:0.95rem; width:100%; cursor:default;"
+        )
+    else:
+        style = (
+            "background:#1e2127; color:#aaa; border:1px solid #444; border-radius:8px; "
+            "padding:8px 0; font-weight:bold; font-size:0.95rem; width:100%; cursor:pointer;"
+        )
+    with nav_cols[i]:
+        if nav_cols[i].button(label, key=f"nav_{key}", use_container_width=True, disabled=is_active):
+            st.query_params["page"] = key
+            st.rerun()
 
 # ==================== ORTAK HEADER ====================
 h1, h2, h3, h4, h5, h6 = st.columns([2, 1, 1, 1, 1, 1])
@@ -1645,16 +1669,17 @@ elif current_page == "spot":
     """, unsafe_allow_html=True)
 
     # Filtreler
-    spot_col1, spot_col2, spot_col3, spot_col4 = st.columns([1, 1, 1, 1])
+    spot_col1, spot_col2, spot_col3 = st.columns([1, 1, 1])
     spot_search = spot_col1.text_input("🔍 Symbol Ara", placeholder="BTC...", key="spot_search").upper()
-    spot_dir = spot_col2.multiselect(
-        "Yön",
-        ["BUY", "SELL", "NEUTRAL"],
-        default=["BUY", "SELL", "NEUTRAL"],
-        key="spot_dir"
+    spot_type_filter = spot_col2.multiselect(
+        "Sinyal Tipi",
+        ["🐋 WHALE BUY", "🐋 WHALE SELL", "🔥 SURGE BUY", "💥 SURGE SELL",
+         "📈 SPOT BUY", "📉 SPOT SELL", "💰 LARGE BUY", "💰 LARGE SELL"],
+        default=["🐋 WHALE BUY", "🐋 WHALE SELL", "🔥 SURGE BUY", "💥 SURGE SELL",
+                 "📈 SPOT BUY", "📉 SPOT SELL", "💰 LARGE BUY", "💰 LARGE SELL"],
+        key="spot_type"
     )
     whale_only = spot_col3.checkbox("🐋 Sadece Whale", value=False)
-    min_chg_spot = spot_col4.slider("Min Değişim %", 0.0, 10.0, 0.0, step=0.5, key="spot_minchg")
 
     st.divider()
 
@@ -1699,7 +1724,6 @@ elif current_page == "spot":
                     "<th>Fiyat</th>"
                     "<th>24H Değ.</th>"
                     "<th>Sinyal</th>"
-                    "<th>Alım/Satım Baskısı</th>"
                     "<th>Büyük İşlem</th>"
                     "<th>Hacim</th>"
                     "</tr>"
@@ -1713,19 +1737,6 @@ elif current_page == "spot":
                     chg = row['Chg']
                     chg_color = "#00ff88" if chg > 0 else "#ff4b4b"
                     chg_str = f"<span style='color:{chg_color}; font-weight:bold;'>{chg:+.2f}%</span>"
-
-                    buy_r = row['BuyRatio']
-                    sell_r = row['SellRatio']
-                    pressure_html = (
-                        f"<div style='display:flex; align-items:center; gap:6px;'>"
-                        f"<span style='color:#00b894; font-size:0.78rem;'>B{buy_r:.0f}%</span>"
-                        f"<div class='pressure-bar-container' style='width:70px;'>"
-                        f"<div class='pressure-buy' style='width:{buy_r}%;'></div>"
-                        f"<div class='pressure-sell' style='width:{sell_r}%;'></div>"
-                        f"</div>"
-                        f"<span style='color:#d63031; font-size:0.78rem;'>S{sell_r:.0f}%</span>"
-                        f"</div>"
-                    )
 
                     whale_html = ""
                     if row['WhaleUSD'] > 0:
@@ -1746,7 +1757,6 @@ elif current_page == "spot":
                         f"<td style='font-family:monospace;'>{row['Price']}</td>"
                         f"<td>{chg_str}</td>"
                         f"<td><span class='{tag_cls}'>{row['SignalType']}</span></td>"
-                        f"<td>{pressure_html}</td>"
                         f"<td>{whale_html}</td>"
                         f"<td style='color:#888;'>{vol_str}</td>"
                         f"</tr>"
@@ -1764,12 +1774,10 @@ elif current_page == "spot":
         display_spot = spot_sigs
         if spot_search:
             display_spot = [s for s in display_spot if spot_search in s['Symbol']]
-        if spot_dir:
-            display_spot = [s for s in display_spot if s['DominantSide'] in spot_dir]
+        if spot_type_filter:
+            display_spot = [s for s in display_spot if s['SignalType'] in spot_type_filter]
         if whale_only:
             display_spot = [s for s in display_spot if s['HasWhale']]
-        if min_chg_spot > 0:
-            display_spot = [s for s in display_spot if abs(s['Chg']) >= min_chg_spot]
 
         render_spot_table(display_spot, spot_main_placeholder)
 

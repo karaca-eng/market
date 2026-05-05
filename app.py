@@ -636,7 +636,7 @@ if "thread_started" not in st.session_state:
 st.sidebar.title("Navigation")
 page = st.sidebar.radio(
     "Sayfa Sec",
-    ["📡 Normal Sinyaller", "🎯 Big Move Hunter"],
+    ["📡 Normal Sinyaller", "📊 MACD Radar", "🎯 Big Move Hunter"],
     index=0,
 )
 st.sidebar.markdown("---")
@@ -708,10 +708,6 @@ if page == "📡 Normal Sinyaller":
     with col_main:
         st.subheader("📡 Intelligence Stream")
         main_placeholder = st.empty()
-
-    with col_macd:
-        st.subheader("📊 MACD Radar")
-        macd_placeholder = st.empty()
 
     def get_mode_css_class(mode):
         if "CONFIRMED" in mode:
@@ -814,37 +810,91 @@ if page == "📡 Normal Sinyaller":
 
         render_table(display_data, main_placeholder)
 
-        with macd_placeholder.container():
-            with radar.lock:
-                candidates = dict(radar.macd_candidates)
-
-            if candidates:
-                def _macd_sort_key(item):
-                    tag = item[1].get("MACD Pattern", "Paralel(0)")
-                    try:
-                        return int(tag.split("(")[1].rstrip(")"))
-                    except:
-                        return 0
-
-                sorted_c = sorted(candidates.items(), key=_macd_sort_key, reverse=True)
-                for sym, info in sorted_c[:20]:
-                    tv_url = f"https://www.tradingview.com/chart/?symbol=BINANCE:{sym}USDT.P"
-                    st.markdown(f"""<div class="macd-radar-card">
-                        <a href="{tv_url}" target="_blank" class="macd-radar-sym">{sym}</a><br>
-                        <span class="macd-radar-tag">{info["MACD Pattern"]}</span>
-                        &nbsp;
-                        <span style="color:#aaa;font-size:0.8rem">{info["Fiyat"]}</span><br>
-                      <span class="macd-radar-time">{info.get("Guncelleme", "N/A")}</span>
-                    </div>""", unsafe_allow_html=True)
-            else:
-                st.caption("MACD taraniyor...")
+    
 
         time.sleep(1.5)
 
 # ================================================================
 # SAYFA 2: BIG MOVE HUNTER
 # ================================================================
-else:
+else: 
+# ================================================================
+# SAYFA 2: MACD RADAR
+# ================================================================
+elif page == "📊 MACD Radar":
+    h1.caption("📊 15 dakikalık grafiklerde paralel MACD yükseliş tespiti")
+
+    st.markdown("""
+    <div style="background-color:#1a1030; border-left:4px solid #8e44ad; padding:12px 16px; border-radius:4px; margin-bottom:16px;">
+        <b style="color:#c39bd3;">MACD Radar Nasıl Çalışır?</b><br>
+        <span style="color:#d5dbdb; font-size:0.9rem;">
+        15 dakikalık mum grafiğinde MACD çizgisi ve sinyal çizgisi <b>paralel biçimde yükseliyor</b> mu?<br>
+        • Pozitif bölgede, bullish, yükselen ve histogram genişleyen mumlar sayılır.<br>
+        • <b>Paralel(N)</b>: Son N mumda koşul sağlandı. 3-8 arası sinyal üretir.<br>
+        </span>
+    </div>
+    """, unsafe_allow_html=True)
+
+    col_m1, col_m2 = st.columns([1, 3])
+    macd_search = col_m1.text_input("🔍 Symbol Ara", placeholder="BTC...", key="macd_search").upper()
+    min_candles = col_m2.slider("Min Paralel Mum Sayısı", 1, 15, 1)
+
+    st.divider()
+
+    def _parse_macd_count(tag):
+        try:
+            return int(tag.split("(")[1].rstrip(")"))
+        except:
+            return 0
+
+    macd_page_placeholder = st.empty()
+
+    while True:
+        with radar.lock:
+            candidates = dict(radar.macd_candidates)
+
+        filtered = {
+            sym: info for sym, info in candidates.items()
+            if (not macd_search or macd_search in sym)
+            and _parse_macd_count(info.get("MACD Pattern", "")) >= min_candles
+        }
+
+        sorted_c = sorted(
+            filtered.items(),
+            key=lambda x: _parse_macd_count(x[1].get("MACD Pattern", "")),
+            reverse=True,
+        )
+
+        with macd_page_placeholder.container():
+            if sorted_c:
+                html = (
+                    "<table><tr>"
+                    "<th>Symbol</th><th>Fiyat</th><th>MACD Pattern</th><th>Güncelleme</th>"
+                    "</tr>"
+                )
+                for sym, info in sorted_c:
+                    tv_url = f"https://www.tradingview.com/chart/?symbol=BINANCE:{sym}USDT.P"
+                    count = _parse_macd_count(info.get("MACD Pattern", ""))
+                    strength_color = "#00ff88" if count >= 6 else "#f39c12" if count >= 3 else "#c39bd3"
+                    html += (
+                        f"<tr class='row-macd'>"
+                        f"<td><a href='{tv_url}' target='_blank' class='sym-link'>{sym}</a></td>"
+                        f"<td>{info['Fiyat']}</td>"
+                        f"<td><span class='macd-tag' style='color:{strength_color}; font-size:0.95rem;'>"
+                        f"{info['MACD Pattern']}</span></td>"
+                        f"<td style='color:#666;'>{info.get('Güncelleme', 'N/A')}</td>"
+                        f"</tr>"
+                    )
+                html += "</table>"
+                st.markdown(html, unsafe_allow_html=True)
+                st.caption(f"Toplam {len(sorted_c)} sembol | Tüm liste: {len(candidates)}")
+            else:
+                st.info("MACD taraniyor... Semboller analiz ediliyor 🔍")
+
+        time.sleep(1.5)
+
+
+elif :
     h1.caption("🎯 Bollinger Squeeze + 4H MA200 Break + 1H MACD Resistance Break")
 
     st.markdown("""

@@ -16,7 +16,7 @@ FAST_STRIKE_CHG = 1.0
 TRI_WINDOW = 180
 MAX_DISPLAY_ROWS = 100
 FETCH_INTERVAL = 10
-PUMP_DUMP_THRESHOLD = 3
+PUMP_DUMP_THRESHOLD = 2.1
 
 # MACD Paralel Ayarları
 MACD_MIN_CANDLES = 3
@@ -42,7 +42,7 @@ BINANCE_REST_URLS = [
 def get_signal_label(direction: str, chg: float) -> str:
     if abs(chg) >= PUMP_DUMP_THRESHOLD:
         return "PUMP" if direction == "up" else "DUMP"
-    return "BUY" if direction == "up" else "SELL"
+    return "LONG" if direction == "up" else "SHORT"
 
 
 # ==================== CORE CLASS ====================

@@ -4,6 +4,8 @@ import numpy as np
 import time
 import threading
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from datetime import datetime
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
@@ -38,6 +40,41 @@ BINANCE_REST_URLS = [
     "https://fapi2.binance.com",
 ]
 
+# ==================== SESSION & RETRY SETUP ====================
+def create_session():
+    """418 ve rate-limit hatalarına karşı retry mekanizmalı session oluşturur."""
+    session = requests.Session()
+    
+    # Gerçek tarayıcı header'ları
+    session.headers.update({
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        'Accept': 'application/json, text/plain, */*',
+        'Accept-Language': 'en-US,en;q=0.9,tr;q=0.8',
+        'Accept-Encoding': 'gzip, deflate, br',
+        'Referer': 'https://www.tradingview.com/',
+        'Origin': 'https://www.tradingview.com',
+        'Connection': 'keep-alive',
+        'Sec-Fetch-Dest': 'empty',
+        'Sec-Fetch-Mode': 'cors',
+        'Sec-Fetch-Site': 'cross-site',
+        'Cache-Control': 'no-cache',
+        'Pragma': 'no-cache',
+    })
+    
+    # Retry stratejisi: 418, 429, 502, 503, 504 için tekrar dene
+    retry_strategy = Retry(
+        total=3,
+        backoff_factor=1.5,  # 1.5s, 3s, 6s bekleme
+        status_forcelist=[418, 429, 500, 502, 503, 504],
+        allowed_methods=["HEAD", "GET", "OPTIONS"]
+    )
+    
+    adapter = HTTPAdapter(max_retries=retry_strategy, pool_connections=10, pool_maxsize=20)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    
+    return session
+
 # ==================== HELPERS ====================
 def get_signal_label(direction: str, chg: float) -> str:
     if abs(chg) >= PUMP_DUMP_THRESHOLD:
@@ -57,10 +94,10 @@ class MarketRadar:
         self.total_pairs = 0
         self.last_reset_hour = datetime.now().hour
         self.last_reset_4h_block = datetime.now().hour // 4
-        self.headers = {'User-Agent': 'Mozilla/5.0'}
         self.rest_base_url = BINANCE_REST_URLS[0]
         self.price_cache_15m = {}
         self.debug_log = []
+        self.session = create_session()  # YENİ: Session tabanlı istekler
 
         # MACD state
         self.macd_sent = {}
@@ -86,7 +123,8 @@ class MarketRadar:
     def get_working_rest_url(self):
         for url in BINANCE_REST_URLS:
             try:
-                r = requests.get(f"{url}/fapi/v1/ping", timeout=3)
+                # Session kullan, timeout artır
+                r = self.session.get(f"{url}/fapi/v1/ping", timeout=5)
                 if r.status_code == 200:
                     self.rest_base_url = url
                     self.log(f"✅ Binance bağlantısı OK: {url}")
@@ -95,8 +133,24 @@ class MarketRadar:
                     self.log(f"⚠️ {url} → status {r.status_code}")
             except Exception as e:
                 self.log(f"❌ {url} → HATA: {e}")
+            time.sleep(0.5)  # URL'ler arası bekle
         self.log("🔴 Hiçbir Binance URL'e bağlanılamadı!")
         return self.rest_base_url
+
+    def _safe_request(self, url, timeout=5):
+        """418 hatalarını önlemek için güvenli istek wrapper'ı."""
+        try:
+            # İstek öncesi kısa bekleme (rate limit koruması)
+            time.sleep(0.05)
+            response = self.session.get(url, timeout=timeout)
+            if response.status_code == 418:
+                self.log(f"⚠️ 418 TEAPOT alındı, 2sn bekleniyor... → {url[:60]}")
+                time.sleep(2.0)
+                response = self.session.get(url, timeout=timeout)
+            return response
+        except Exception as e:
+            self.log(f"❌ İstek hatası: {e}")
+            return None
 
     def check_resets(self):
         now = datetime.now()
@@ -163,13 +217,13 @@ class MarketRadar:
                 return price
         try:
             url = f"{self.rest_base_url}/fapi/v1/klines?symbol={symbol}&interval=15m&limit=2"
-            response = requests.get(url, headers=self.headers, timeout=2)
-            if response.status_code == 200:
+            response = self._safe_request(url, timeout=3)  # YENİ: safe_request kullan
+            if response and response.status_code == 200:
                 price = float(response.json()[0][1])
                 self.price_cache_15m[symbol] = (now, price)
                 return price
-        except:
-            pass
+        except Exception as e:
+            self.log(f"15m price hata ({symbol}): {e}")
         return None
 
     def add_signal(self, symbol, price, chg_main, chg_ref, vol, s_type, mode, score=50, macd_tag=None):
@@ -230,20 +284,21 @@ class MarketRadar:
     def _fetch_klines(self, symbol, interval, limit):
         url = f"{self.rest_base_url}/fapi/v1/klines?symbol={symbol}&interval={interval}&limit={limit}"
         try:
-            resp = requests.get(url, timeout=3)
-            if resp.status_code != 200:
+            resp = self._safe_request(url, timeout=5)  # YENİ: safe_request
+            if not resp or resp.status_code != 200:
                 return None
             raw = resp.json()
             closes = [float(c[4]) for c in raw]
             return pd.Series(closes, name='close')
-        except:
+        except Exception as e:
+            self.log(f"Kline hata ({symbol} {interval}): {e}")
             return None
 
     def _fetch_klines_ohlc(self, symbol, interval, limit):
         url = f"{self.rest_base_url}/fapi/v1/klines?symbol={symbol}&interval={interval}&limit={limit}"
         try:
-            resp = requests.get(url, timeout=3)
-            if resp.status_code != 200:
+            resp = self._safe_request(url, timeout=5)  # YENİ: safe_request
+            if not resp or resp.status_code != 200:
                 return None
             raw = resp.json()
             data = {
@@ -254,7 +309,8 @@ class MarketRadar:
                 'volume': [float(c[5]) for c in raw],
             }
             return pd.DataFrame(data)
-        except:
+        except Exception as e:
+            self.log(f"OHLC hata ({symbol} {interval}): {e}")
             return None
 
     def _analyze_macd_window(self, closes: pd.Series) -> int:
@@ -558,10 +614,10 @@ def binance_worker(radar_obj):
     while True:
         try:
             url = f"{radar_obj.rest_base_url}/fapi/v1/ticker/24hr"
-            r = requests.get(url, timeout=5)
+            response = radar_obj._safe_request(url, timeout=8)  # YENİ: safe_request
             fetch_count += 1
-            if r.status_code == 200:
-                raw = r.json()
+            if response and response.status_code == 200:
+                raw = response.json()
                 formatted = [{'s': x['symbol'], 'c': x['lastPrice'], 'q': x['quoteVolume']} for x in raw]
                 radar_obj.process_ticker(formatted)
                 if fetch_count % 10 == 0:
@@ -572,7 +628,10 @@ def binance_worker(radar_obj):
                         f"BigMove: {len(radar_obj.bigmove_signals)}"
                     )
             else:
-                radar_obj.log(f"⚠️ HTTP {r.status_code}")
+                status = response.status_code if response else "NO RESPONSE"
+                radar_obj.log(f"⚠️ HTTP {status}")
+                if response and response.status_code == 418:
+                    time.sleep(5)  # 418 alındığında bekle
         except Exception as e:
             radar_obj.log(f"❌ WORKER HATA: {e}")
         time.sleep(FETCH_INTERVAL)
@@ -810,12 +869,9 @@ if page == "📡 Normal Sinyaller":
 
         render_table(display_data, main_placeholder)
 
-    
-
         time.sleep(1.5)
 
 # ================================================================
-
 # SAYFA 2: MACD RADAR
 # ================================================================
 elif page == "📊 MACD Radar":
@@ -889,8 +945,9 @@ elif page == "📊 MACD Radar":
                 st.info("MACD taraniyor... Semboller analiz ediliyor 🔍")
 
         time.sleep(1.5)
+
 # ================================================================        
-# SAYFA 2: BIG MOVE HUNTER
+# SAYFA 3: BIG MOVE HUNTER
 # ================================================================
 
 elif page == "🎯 Big Move Hunter":

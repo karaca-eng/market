@@ -42,7 +42,7 @@ BINANCE_REST_URLS = [
 def get_signal_label(direction: str, chg: float) -> str:
     if abs(chg) >= PUMP_DUMP_THRESHOLD:
         return "PUMP" if direction == "up" else "DUMP"
-    return "LONG" if direction == "up" else "SHORT"
+    return "BUY" if direction == "up" else "SELL"
 
 
 # ==================== CORE CLASS ====================

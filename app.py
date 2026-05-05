@@ -818,7 +818,7 @@ if page == "📡 Normal Sinyaller":
 
 # SAYFA 2: MACD RADAR
 # ================================================================
-elif :
+elif page == "📊 MACD Radar":
     h1.caption("📊 15 dakikalık grafiklerde paralel MACD yükseliş tespiti")
 
     st.markdown("""
@@ -893,8 +893,7 @@ elif :
 # SAYFA 2: BIG MOVE HUNTER
 # ================================================================
 
-
-elif :
+elif page == "🎯 Big Move Hunter":
     h1.caption("🎯 Bollinger Squeeze + 4H MA200 Break + 1H MACD Resistance Break")
 
     st.markdown("""

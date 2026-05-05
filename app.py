@@ -821,7 +821,7 @@ else:
 # ================================================================
 # SAYFA 2: MACD RADAR
 # ================================================================
-elif page == "📊 MACD Radar":
+elif :
     h1.caption("📊 15 dakikalık grafiklerde paralel MACD yükseliş tespiti")
 
     st.markdown("""

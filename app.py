@@ -20,19 +20,9 @@ MAX_DISPLAY_ROWS = 100
 FETCH_INTERVAL = 10
 PUMP_DUMP_THRESHOLD = 2.2
 
-# MACD Paralel Ayarları
-MACD_MIN_CANDLES = 3
-MACD_MAX_CANDLES = 8
-MACD_COOLDOWN = 180
-MACD_EXECUTOR = ThreadPoolExecutor(max_workers=15)
-
-# BIG MOVE AYARLARI
-BIGMOVE_EXECUTOR = ThreadPoolExecutor(max_workers=20)
-BIGMOVE_COOLDOWN = 600
-BB_SQUEEZE_LOOKBACK = 100
-BB_SQUEEZE_PERCENTILE = 5
-MA200_MIN_BARS_BELOW = 20
-MACD_RESISTANCE_LOOKBACK = 20
+# MACD Pattern Ayarlari
+MACD_PATTERN_EXECUTOR = ThreadPoolExecutor(max_workers=15)
+MACD_PATTERN_COOLDOWN = 180
 
 BINANCE_REST_URLS = [
     "https://fapi.binance.com",
@@ -40,19 +30,277 @@ BINANCE_REST_URLS = [
     "https://fapi2.binance.com",
 ]
 
+# ==================== NEW MACD PATTERN SYSTEM ====================
+
+def calculate_macd(close_prices, fast=12, slow=26, signal=9):
+    """15dk MACD hesaplama"""
+    close = np.array(close_prices, dtype=float)
+
+    def ema(data, span):
+        k = 2 / (span + 1)
+        result = [data[0]]
+        for price in data[1:]:
+            result.append(price * k + result[-1] * (1 - k))
+        return np.array(result)
+
+    exp1 = ema(close, fast)
+    exp2 = ema(close, slow)
+    macd = exp1 - exp2
+    sig = ema(macd, signal)
+
+    return macd, sig
+
+
+def detect_whale_trap(m, s, volume_ratio=1.0):
+    """
+    WHALE TRAP
+    - MACD sifir uzerinde
+    - Mavi kirmiziyi yukari kesti
+    - Onceki barlarda sikisma vardi
+    - Volume artisi (opsiyonel)
+    - MACD ivmesi artiyor
+    - Signal da yukari dondu
+    """
+    if len(m) < 6:
+        return None
+
+    macd_range = max(m[-6:-1]) - min(m[-6:-1])
+    avg_move = np.mean([abs(m[i] - m[i-1]) for i in range(-5, -1)])
+    compression = macd_range < avg_move * 2.5
+
+    conditions = {
+        "zero_above": m[-1] > 0,
+        "crossover": m[-1] > s[-1] and m[-2] <= s[-2],
+        "compression": compression,
+        "signal_turning": s[-1] > s[-2] > s[-3],
+        "volume_confirm": volume_ratio > 1.8,
+        "momentum_accel": (m[-1] - m[-2]) > (m[-2] - m[-3]) > 0,
+    }
+
+    score = sum(conditions.values())
+
+    if score == 6: return "WHALE TRAP — EFSANE (6/6)"
+    if score >= 4: return f"WHALE TRAP — Guclu ({score}/6)"
+    if score >= 3: return f"WHALE TRAP — Zayif ({score}/6)"
+    return None
+
+
+def detect_final_breakout(m, s, close_prices):
+    """
+    FINAL BREAKOUT
+    - Mavi kirmiziyi yukari kesti
+    - Histogram her bar genisliyor
+    - MACD ivmesi logaritmik artiyor
+    - Signal 3 bar ust uste yukari
+    - Fiyat higher-high yapiyor
+    - Momentum farki guclu
+    """
+    if len(m) < 6 or len(close_prices) < 7:
+        return None
+
+    h = m - s
+    hist_expanding = abs(h[-1]) > abs(h[-2]) > abs(h[-3]) and h[-1] > 0
+    slopes = [m[-i] - m[-i-1] for i in range(1, 4)]
+    accel = slopes[0] > slopes[1] > slopes[2] > 0
+    signal_flip = s[-1] > s[-2] > s[-3]
+    prices = np.array(close_prices)
+    higher_high = prices[-1] > max(prices[-6:-1])
+
+    conditions = {
+        "crossover": m[-1] > s[-1] and m[-2] <= s[-2],
+        "hist_expanding": hist_expanding,
+        "accel": accel,
+        "signal_flip": signal_flip,
+        "higher_high": higher_high,
+        "strong_momentum": (m[-1] - m[-2]) > (s[-1] - s[-2]) * 2.0,
+    }
+
+    score = sum(conditions.values())
+
+    if score == 6: return "FINAL BREAKOUT — EFSANE (6/6)"
+    if score >= 4: return f"FINAL BREAKOUT — Guclu ({score}/6)"
+    if score >= 3: return f"FINAL BREAKOUT — Erken ({score}/6)"
+    return None
+
+
+def detect_triple_cross(m, s):
+    """
+    TRIPLE CROSS (15dk MACD)
+    - Mavi kirmiziyi 3 kez yukari kesiyor
+    - 1. kesisim MUTLAKA sifir altinda
+    - 2. ve 3. kesisim seviyesi fark etmez
+    - Her kesisim bir oncekinden DAHA YUKSEK
+    - 3. kesisimde alarm
+    """
+    if len(m) < 10:
+        return None
+
+    crosses = []
+    for i in range(len(m) - 1, 1, -1):
+        if m[i] > s[i] and m[i-1] <= s[i-1]:
+            crosses.append({
+                "bar_index": i,
+                "level": m[i],
+                "below_zero": m[i] < 0
+            })
+
+    if len(crosses) < 3:
+        return None
+
+    c1 = crosses[0]
+    c2 = crosses[1]
+    c3 = crosses[2]
+
+    if not (m[-1] > s[-1] and m[-2] <= s[-2]):
+        return None
+    if not c3["below_zero"]:
+        return None
+    if not (c1["level"] > c2["level"] > c3["level"]):
+        return None
+    if (c1["bar_index"] - c2["bar_index"]) < 3:
+        return None
+    if (c2["bar_index"] - c3["bar_index"]) < 3:
+        return None
+
+    diff1 = c2["level"] - c3["level"]
+    diff2 = c1["level"] - c2["level"]
+    accelerating = diff2 > diff1 > 0
+
+    levels = f"[{c3['level']:.6f}->{c2['level']:.6f}->{c1['level']:.6f}]"
+
+    if accelerating: return f"TRIPLE CROSS — EFSANE {levels}"
+    else: return f"TRIPLE CROSS — Guclu {levels}"
+
+
+def detect_dalga(m, s):
+    """
+    DALGA — 5 Adim MACD Sistemi
+    Adim1: Paralel cikis (sifir alti sikisma)
+    Adim2: Sifiri yukari keser
+    Adim3: Geri cekilir (higher low)
+    Adim4: Tekrar yukari keser -> TAKIBE AL
+    Adim5: Impuls cikis -> AL
+    """
+    if len(m) < 50:
+        return None, {}
+
+    h = m - s
+    threshold = np.mean([abs(m[i] - s[i]) for i in range(-50, 0)]) * 0.20
+
+    state = 0
+    meta = {}
+    step1_macds = []
+
+    i = 1
+    while i < len(m):
+        idx = i - len(m)
+
+        if state == 0:
+            cond_below = m[idx] < 0 and s[idx] < 0
+            cond_close = abs(m[idx] - s[idx]) < threshold
+            cond_slope_m = (m[idx] - m[idx-1]) <= 0
+            cond_slope_s = (s[idx] - s[idx-1]) <= 0
+
+            if cond_below and cond_close and cond_slope_m and cond_slope_s:
+                step1_macds.append(m[idx])
+                if len(step1_macds) >= 3:
+                    state = 1
+                    meta["step1_index"] = i
+                    meta["step1_low"] = min(step1_macds)
+            else:
+                step1_macds = []
+
+        elif state == 1:
+            if m[idx-1] <= 0 and m[idx] > 0:
+                state = 2
+                meta["step2_index"] = i
+                meta["step2_peak"] = m[idx]
+
+        elif state == 2:
+            if m[idx-1] >= 0 and m[idx] < 0:
+                if m[idx] > meta["step1_low"]:
+                    state = 3
+                    meta["step3_index"] = i
+                    meta["step3_low"] = m[idx]
+                else:
+                    state = 0
+                    step1_macds = []
+                    meta = {}
+
+        elif state == 3:
+            if m[idx] < 0:
+                if m[idx] < meta["step1_low"]:
+                    state = 0
+                    step1_macds = []
+                    meta = {}
+                else:
+                    meta["step3_low"] = min(meta["step3_low"], m[idx])
+            elif m[idx-1] <= 0 and m[idx] > 0:
+                state = 4
+                meta["step4_index"] = i
+
+        elif state == 4:
+            cond_above = m[idx] > 0
+            cond_rising = m[idx] > m[idx-1]
+            cond_hist = h[idx] > h[idx-1]
+            cond_new_high = m[idx] > meta["step2_peak"]
+
+            if cond_above and cond_rising and cond_hist and cond_new_high:
+                state = 5
+                meta["step5_index"] = i
+                break
+
+        i += 1
+
+    labels = {
+        5: "DALGA — AL SINYALI (5/5)",
+        4: "DALGA — TAKIPTE (4/5)",
+        3: "DALGA — Geri Cekildi (3/5)",
+        2: "DALGA — Sifir Ustu (2/5)",
+        1: "DALGA — Sikisma (1/5)",
+    }
+
+    if state >= 1:
+        return labels[state], meta
+    return None, {}
+
+
+def run_signals(close_prices, volume_ratio=1.0):
+    """
+    4 pattern bagimsiz olarak calisir.
+    Her biri kendi sonucunu dondurur, birbirini etkilemez.
+    """
+    if len(close_prices) < 50:
+        return {
+            "WHALE_TRAP": None,
+            "FINAL_BREAKOUT": None,
+            "TRIPLE_CROSS": None,
+            "DALGA": None,
+        }
+
+    m, s = calculate_macd(close_prices)
+    dalga, _ = detect_dalga(m, s)
+
+    return {
+        "WHALE_TRAP": detect_whale_trap(m, s, volume_ratio),
+        "FINAL_BREAKOUT": detect_final_breakout(m, s, close_prices),
+        "TRIPLE_CROSS": detect_triple_cross(m, s),
+        "DALGA": dalga,
+    }
+
+
 # ==================== SESSION & RETRY SETUP ====================
 def create_session():
-    """418 ve rate-limit hatalarına karşı retry mekanizmalı session oluşturur."""
+    """418 ve rate-limit hatalarina karsi retry mekanismali session olusturur."""
     session = requests.Session()
-    
-    # Gerçek tarayıcı header'ları
+
     session.headers.update({
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
         'Accept': 'application/json, text/plain, */*',
         'Accept-Language': 'en-US,en;q=0.9,tr;q=0.8',
         'Accept-Encoding': 'gzip, deflate, br',
         'Referer': 'https://www.tradingview.com/',
-        'Origin': 'https://www.tradingview.com',
+        'Origin': 'https://www.tradingview.com/',
         'Connection': 'keep-alive',
         'Sec-Fetch-Dest': 'empty',
         'Sec-Fetch-Mode': 'cors',
@@ -60,19 +308,18 @@ def create_session():
         'Cache-Control': 'no-cache',
         'Pragma': 'no-cache',
     })
-    
-    # Retry stratejisi: 418, 429, 502, 503, 504 için tekrar dene
+
     retry_strategy = Retry(
         total=3,
-        backoff_factor=1.5,  # 1.5s, 3s, 6s bekleme
+        backoff_factor=1.5,
         status_forcelist=[418, 429, 500, 502, 503, 504],
         allowed_methods=["HEAD", "GET", "OPTIONS"]
     )
-    
+
     adapter = HTTPAdapter(max_retries=retry_strategy, pool_connections=10, pool_maxsize=20)
     session.mount("https://", adapter)
     session.mount("http://", adapter)
-    
+
     return session
 
 # ==================== HELPERS ====================
@@ -97,19 +344,12 @@ class MarketRadar:
         self.rest_base_url = BINANCE_REST_URLS[0]
         self.price_cache_15m = {}
         self.debug_log = []
-        self.session = create_session()  # YENİ: Session tabanlı istekler
+        self.session = create_session()
 
-        # MACD state
-        self.macd_sent = {}
-        self.macd_sent_keys = {}
-        self.macd_candidates = {}
-        self.macd_last_trigger = {}
-
-        # BIG MOVE state
-        self.bigmove_signals = []
-        self.bigmove_sent = {}
-        self.bigmove_candidates = {}
-        self.bigmove_last_trigger = {}
+        # MACD Pattern state - YENI PATTERN SISTEMI
+        self.macd_pattern_sent = {}
+        self.macd_pattern_candidates = {}
+        self.macd_pattern_last_trigger = {}
 
     def log(self, msg):
         t = datetime.now().strftime("%H:%M:%S")
@@ -123,33 +363,30 @@ class MarketRadar:
     def get_working_rest_url(self):
         for url in BINANCE_REST_URLS:
             try:
-                # Session kullan, timeout artır
                 r = self.session.get(f"{url}/fapi/v1/ping", timeout=5)
                 if r.status_code == 200:
                     self.rest_base_url = url
-                    self.log(f"✅ Binance bağlantısı OK: {url}")
+                    self.log(f"Binance baglantisi OK: {url}")
                     return url
                 else:
-                    self.log(f"⚠️ {url} → status {r.status_code}")
+                    self.log(f"{url} -> status {r.status_code}")
             except Exception as e:
-                self.log(f"❌ {url} → HATA: {e}")
-            time.sleep(0.5)  # URL'ler arası bekle
-        self.log("🔴 Hiçbir Binance URL'e bağlanılamadı!")
+                self.log(f"{url} -> HATA: {e}")
+            time.sleep(0.5)
+        self.log("Hicbir Binance URL'e baglanilamadi!")
         return self.rest_base_url
 
     def _safe_request(self, url, timeout=5):
-        """418 hatalarını önlemek için güvenli istek wrapper'ı."""
         try:
-            # İstek öncesi kısa bekleme (rate limit koruması)
             time.sleep(0.05)
             response = self.session.get(url, timeout=timeout)
             if response.status_code == 418:
-                self.log(f"⚠️ 418 TEAPOT alındı, 2sn bekleniyor... → {url[:60]}")
+                self.log(f"418 TEAPOT alindi, 2sn bekleniyor... -> {url[:60]}")
                 time.sleep(2.0)
                 response = self.session.get(url, timeout=timeout)
             return response
         except Exception as e:
-            self.log(f"❌ İstek hatası: {e}")
+            self.log(f"Istek hatasi: {e}")
             return None
 
     def check_resets(self):
@@ -176,8 +413,7 @@ class MarketRadar:
                     self.history[symbol] = deque(maxlen=400)
                 self.history[symbol].append((now, price, quote_vol))
                 self.check_logic(symbol, now)
-                self._maybe_trigger_macd(symbol, price, now)
-                self._maybe_trigger_bigmove(symbol, price, now)
+                self._maybe_trigger_macd_pattern(symbol, price, now)
 
     def check_logic(self, symbol, now):
         hist = list(self.history[symbol])
@@ -196,7 +432,7 @@ class MarketRadar:
         if abs(c1) >= FAST_STRIKE_CHG and vol_1m >= 50000:
             direction = "up" if c1 > 0 else "down"
             label = get_signal_label(direction, c1)
-            self.add_signal(symbol, current[1], c1, 0, vol_1m, label, "⚡ FLASH", score=40)
+            self.add_signal(symbol, current[1], c1, 0, vol_1m, label, "FLASH", score=40)
             return
 
         if vol_3m >= MIN_VOL_3M and abs(c3) >= MIN_CHG_3M:
@@ -207,7 +443,7 @@ class MarketRadar:
                 if is_consistent and abs(c15) >= CONFIRM_CHG_15M:
                     direction = "up" if c3 > 0 else "down"
                     label = get_signal_label(direction, c3)
-                    self.add_signal(symbol, current[1], c3, c15, vol_3m, label, "💎 CONFIRMED", score=55)
+                    self.add_signal(symbol, current[1], c3, c15, vol_3m, label, "CONFIRMED", score=55)
 
     def get_15m_price(self, symbol):
         now = time.time()
@@ -217,7 +453,7 @@ class MarketRadar:
                 return price
         try:
             url = f"{self.rest_base_url}/fapi/v1/klines?symbol={symbol}&interval=15m&limit=2"
-            response = self._safe_request(url, timeout=3)  # YENİ: safe_request kullan
+            response = self._safe_request(url, timeout=3)
             if response and response.status_code == 200:
                 price = float(response.json()[0][1])
                 self.price_cache_15m[symbol] = (now, price)
@@ -226,7 +462,7 @@ class MarketRadar:
             self.log(f"15m price hata ({symbol}): {e}")
         return None
 
-    def add_signal(self, symbol, price, chg_main, chg_ref, vol, s_type, mode, score=50, macd_tag=None):
+    def add_signal(self, symbol, price, chg_main, chg_ref, vol, s_type, mode, score=50, macd_pattern=None):
         t_str = datetime.now().strftime("%H:%M:%S")
         sym_clean = symbol.replace("USDT", "")
         is_up = s_type in ("PUMP", "BUY")
@@ -257,12 +493,181 @@ class MarketRadar:
                 "Score": score,
                 "SnapP": self.stats_4h[sym_clean]["PUMP"],
                 "SnapD": self.stats_4h[sym_clean]["DUMP"],
-                "MACD": macd_tag or "",
+                "MACD_Pattern": macd_pattern or "",
             })
-            self.log(f"🚨 SİNYAL: {sym_clean} {s_type} {mode} {chg_main:+.2f}%" +
-                     (f" | {macd_tag}" if macd_tag else ""))
+            self.log(f"SINYAL: {sym_clean} {s_type} {mode} {chg_main:+.2f}%" +
+                     (f" | {macd_pattern}" if macd_pattern else ""))
             if len(self.signals) > MAX_DISPLAY_ROWS:
                 self.signals.pop()
+
+    # ================================================================
+    # YENI MACD PATTERN SISTEMI
+    # ================================================================
+
+    def _fetch_klines_for_pattern(self, symbol, interval="15m", limit=200):
+        """MACD pattern analizi icin kline verisi ceker (close fiyatlari)"""
+        url = f"{self.rest_base_url}/fapi/v1/klines?symbol={symbol}&interval={interval}&limit={limit}"
+        try:
+            resp = self._safe_request(url, timeout=5)
+            if not resp or resp.status_code != 200:
+                return None
+            raw = resp.json()
+            closes = [float(c[4]) for c in raw]
+            volumes = [float(c[5]) for c in raw]
+            return closes, volumes
+        except Exception as e:
+            self.log(f"Kline hata ({symbol} {interval}): {e}")
+            return None
+
+    def _maybe_trigger_macd_pattern(self, symbol, price, now):
+        """Fiyat hareketine gore MACD pattern analizini tetikler"""
+        hist = list(self.history.get(symbol, []))
+        if len(hist) < 6:
+            return
+        last_t = self.macd_pattern_last_trigger.get(symbol, 0)
+        if now - last_t < 20:
+            return
+        past_1m = next((x for x in reversed(hist) if now - x[0] >= 60), hist[0])
+        p_chg_1m = abs(((price - past_1m[1]) / past_1m[1]) * 100)
+        if p_chg_1m >= 1.00:
+            self.macd_pattern_last_trigger[symbol] = now
+            MACD_PATTERN_EXECUTOR.submit(self._run_macd_pattern_analysis, symbol, price)
+
+    def _run_macd_pattern_analysis(self, symbol, price):
+        """15dk kline verisi cekip 4 MACD pattern'ini kontrol eder"""
+        result = self._fetch_klines_for_pattern(symbol, "15m", 200)
+        if result is None:
+            return
+
+        closes, volumes = result
+        if len(closes) < 50:
+            return
+
+        # Volume ratio hesapla (son bar / son 20 bar ortalama)
+        volume_ratio = 1.0
+        if len(volumes) >= 21:
+            avg_vol = np.mean(volumes[-21:-1])
+            if avg_vol > 0:
+                volume_ratio = volumes[-1] / avg_vol
+
+        # 4 pattern'i calistir
+        signals = run_signals(closes, volume_ratio)
+
+        sym_clean = symbol.replace("USDT", "")
+        now = time.time()
+
+        # En guclu pattern'i sec (oncelik sirasi: EFSANE > Guclu > Erken/Zayif)
+        best_pattern = None
+        best_score = 0
+        best_key = None
+
+        for key, value in signals.items():
+            if value is None:
+                continue
+            score = 0
+            if "EFSANE" in value:
+                score = 100
+            elif "Guclu" in value:
+                score = 70
+            elif "Erken" in value or "Zayif" in value or "TAKIPTE" in value or "AL SINYALI" in value:
+                score = 50
+            elif any(x in value for x in ["Sikisma", "Sifir Ustu", "Geri Cekildi"]):
+                score = 30
+
+            if score > best_score:
+                best_score = score
+                best_pattern = value
+                best_key = key
+
+        with self.lock:
+            if best_pattern:
+                self.macd_pattern_candidates[sym_clean] = {
+                    "Sembol": sym_clean,
+                    "Fiyat": f"{price:.4f}" if price < 1 else f"{price:.2f}",
+                    "Pattern": best_pattern,
+                    "PatternTip": best_key or "",
+                    "Guncelleme": datetime.now().strftime("%H:%M:%S"),
+                }
+
+                # Sinyal listesindeki mevcut kaydi guncelle veya yeni ekle
+                cooldown_key = f"{sym_clean}_{best_key}"
+                if now - self.macd_pattern_sent.get(sym_clean, 0) < MACD_PATTERN_COOLDOWN:
+                    # Cooldown aktif - sadece etiketi guncelle
+                    updated = False
+                    for sig in self.signals[:20]:
+                        if sig.get('Symbol') == sym_clean:
+                            sig['MACD_Pattern'] = best_pattern
+                            updated = True
+                            break
+                    if not updated:
+                        # Mevcut sinyal yoksa aday listesinde kalsin
+                        pass
+                else:
+                    self.macd_pattern_sent[sym_clean] = now
+                    # Mevcut sinyallerde bu sembol varsa etiket ekle
+                    updated = False
+                    for sig in self.signals[:20]:
+                        if sig.get('Symbol') == sym_clean:
+                            sig['MACD_Pattern'] = best_pattern
+                            updated = True
+                            self.log(f"MACD PATTERN eklendi: {sym_clean} -> {best_pattern}")
+                            break
+
+                    if not updated:
+                        # Yeni MACD sinyali olustur
+                        self.add_signal(
+                            symbol=symbol,
+                            price=price,
+                            chg_main=0.0,
+                            chg_ref=0.0,
+                            vol=0,
+                            s_type="BUY",
+                            mode="MACD PATTERN",
+                            score=60,
+                            macd_pattern=best_pattern,
+                        )
+                        self.log(f"MACD PATTERN SINYAL: {sym_clean} {best_pattern}")
+            else:
+                # Pattern kalmadiysa aday listesinden kaldir
+                if sym_clean in self.macd_pattern_candidates:
+                    del self.macd_pattern_candidates[sym_clean]
+
+
+# ==================== WORKER ====================
+@st.cache_resource
+def get_radar_instance():
+    return MarketRadar()
+
+
+def binance_worker(radar_obj):
+    radar_obj.log(">>> WORKER THREAD BASLADI")
+    working_url = radar_obj.get_working_rest_url()
+    radar_obj.log(f">>> Kullanilan URL: {working_url}")
+
+    fetch_count = 0
+    while True:
+        try:
+            url = f"{radar_obj.rest_base_url}/fapi/v1/ticker/24hr"
+            response = radar_obj._safe_request(url, timeout=8)
+            fetch_count += 1
+            if response and response.status_code == 200:
+                raw = response.json()
+                formatted = [{'s': x['symbol'], 'c': x['lastPrice'], 'q': x['quoteVolume']} for x in raw]
+                radar_obj.process_ticker(formatted)
+                if fetch_count % 10 == 0:
+                    radar_obj.log(
+                        f"Fetch #{fetch_count} | Pairs: {radar_obj.total_pairs} | "
+                        f"Signals: {len(radar_obj.signals)} | "
+                        f"MACD Pattern Aday: {len(radar_obj.macd_pattern_candidates)}"
+                    )
+            else:
+                status = response.status_code if response else "NO RESPONSE"
+                radar_obj.log(f"HTTP {status}")
+                if response and response.status_code == 418:
+                    time.sleep(5)
+        except Exception as e:
+            radar_obj.log(f"WORKER HATA: {e}")
+        time.sleep(FETCH_INTERVAL)
 
 
 # ==================== STREAMLIT UI ====================
@@ -280,9 +685,21 @@ st.markdown("""
     .mode-confirmed { background-color: #1abc9c; color: #fff; padding: 2px 8px; border-radius: 4px; font-weight: bold; }
     .mode-flash { background-color: #e67e22; color: #fff; padding: 2px 8px; border-radius: 4px; font-weight: bold; }
     .mode-macd  { background-color: #8e44ad; color: #fff; padding: 2px 8px; border-radius: 4px; font-weight: bold; }
-    .mode-bigmove { background-color: #f39c12; color: #000; padding: 2px 8px; border-radius: 4px; font-weight: bold; }
-    .macd-tag   { background-color: #2c1654; color: #c39bd3; padding: 2px 7px; border-radius: 4px; font-size: 0.78rem; font-weight: bold; border: 1px solid #8e44ad; }
-    .bigmove-tag { background-color: #3d2208; color: #f5b041; padding: 2px 7px; border-radius: 4px; font-size: 0.78rem; font-weight: bold; border: 1px solid #f39c12; }
+    .macd-pattern-tag {
+        padding: 2px 8px; border-radius: 4px; font-size: 0.78rem; font-weight: bold;
+        display: inline-block; white-space: nowrap;
+    }
+    .macd-whale-efsane { background-color: #1a3a4a; color: #00d4ff; border: 1px solid #00d4ff; }
+    .macd-whale-guclu { background-color: #1a2a3a; color: #4db8ff; border: 1px solid #4db8ff; }
+    .macd-whale-zayif { background-color: #1a2020; color: #88aabb; border: 1px solid #557788; }
+    .macd-breakout-efsane { background-color: #1a3a1a; color: #00ff88; border: 1px solid #00ff88; }
+    .macd-breakout-guclu { background-color: #1a2a1a; color: #4dff88; border: 1px solid #4dff88; }
+    .macd-breakout-erken { background-color: #1a2515; color: #88cc66; border: 1px solid #88cc66; }
+    .macd-triple-efsane { background-color: #2a1a3a; color: #ff6bff; border: 1px solid #ff6bff; }
+    .macd-triple-guclu { background-color: #221530; color: #cc88dd; border: 1px solid #cc88dd; }
+    .macd-dalga-al { background-color: #3a2a0a; color: #ffcc00; border: 1px solid #ffcc00; }
+    .macd-dalga-takip { background-color: #2a2010; color: #ccaa44; border: 1px solid #ccaa44; }
+    .macd-dalga-diger { background-color: #1a1a10; color: #999966; border: 1px solid #777755; }
     .stat-card { background-color: #1e2127; padding: 10px; border-radius: 10px; margin-bottom: 10px; border-left: 5px solid #f1c40f; }
     .debug-box { background-color: #1a1a2e; border: 1px solid #333; border-radius: 8px; padding: 10px; font-family: monospace; font-size: 0.75rem; color: #aaa; max-height: 200px; overflow-y: auto; }
     table { width: 100%; border-collapse: collapse; }
@@ -296,19 +713,17 @@ st.markdown("""
     .row-conf-pump  { background-color: rgba(0, 255, 136, 0.08) !important; }
     .row-conf-dump  { background-color: rgba(255, 75,  75,  0.08) !important; }
     .row-macd       { background-color: rgba(142, 68, 173, 0.12) !important; border-left: 3px solid #8e44ad !important; }
-    .row-bigmove    { background-color: rgba(243, 156, 18, 0.15) !important; border-left: 4px solid #f39c12 !important; }
-    .macd-radar-card { background: #1a1030; border: 1px solid #8e44ad; border-radius: 8px; padding: 8px 12px; margin-bottom: 6px; }
-    .macd-radar-sym { color: #c39bd3; font-weight: bold; font-size: 1rem; }
-    .macd-radar-tag { color: #f0c3ff; font-size: 0.82rem; }
-    .macd-radar-time { color: #666; font-size: 0.72rem; }
-    .bigmove-card { background: #2a1d0a; border: 1px solid #f39c12; border-radius: 8px; padding: 10px 14px; margin-bottom: 8px; }
-    .bigmove-sym { color: #f5b041; font-weight: bold; font-size: 1.1rem; }
-    .bigmove-cond { color: #f8c471; font-size: 0.85rem; }
-    .bigmove-score { color: #fff; font-weight: bold; font-size: 0.9rem; }
-    .bigmove-time { color: #888; font-size: 0.72rem; }
-    .bigmove-radar-card { background: #1a1508; border: 1px solid #7f8c8d; border-radius: 8px; padding: 8px 12px; margin-bottom: 6px; }
-    .bigmove-radar-sym { color: #d5dbdb; font-weight: bold; font-size: 1rem; }
-    .bigmove-radar-cond { color: #aab7b8; font-size: 0.82rem; }
+    .pattern-radar-card {
+        border-radius: 8px; padding: 8px 12px; margin-bottom: 6px;
+        border-left: 4px solid;
+    }
+    .pattern-whale { background: #0f1f2f; border-color: #00d4ff; }
+    .pattern-breakout { background: #0f2f1f; border-color: #00ff88; }
+    .pattern-triple { background: #1f0f2f; border-color: #ff6bff; }
+    .pattern-dalga { background: #2a2008; border-color: #ffcc00; }
+    .pattern-radar-sym { font-weight: bold; font-size: 1rem; }
+    .pattern-radar-pattern { font-size: 0.82rem; }
+    .pattern-radar-time { color: #666; font-size: 0.72rem; }
     </style>
 """, unsafe_allow_html=True)
 
@@ -323,15 +738,15 @@ if "thread_started" not in st.session_state:
 st.sidebar.title("Navigation")
 page = st.sidebar.radio(
     "Sayfa Sec",
-    ["📡 Normal Sinyaller", "📊 MACD Radar", "🎯 Big Move Hunter"],
+    ["Normal Sinyaller", "MACD Pattern Radar"],
     index=0,
 )
 st.sidebar.markdown("---")
-st.sidebar.caption("v2.0 | Market Radar Pro")
+st.sidebar.caption("v2.1 | Market Radar Pro")
 
 # Header ortak
 h1, h2, h3, h4 = st.columns([2, 1, 1, 1])
-h1.title("📡 Market Radar Pro")
+h1.title("Market Radar Pro")
 
 elapsed = time.time() - radar.last_heartbeat
 status_html = (
@@ -341,17 +756,17 @@ status_html = (
 )
 h2.markdown(f"<div style='margin-top:10px;'>{status_html}</div>", unsafe_allow_html=True)
 h2.markdown(
-    '<a href="https://x.com/SinyalEngineer" target="_blank" style="color:white; text-decoration:none;">𝕏 @SinyalEngineer</a>',
+    '<a href="https://x.com/SinyalEngineer" target="_blank" style="color:white; text-decoration:none;">X @SinyalEngineer</a>',
     unsafe_allow_html=True,
 )
 h3.metric("Pairs Tracked", radar.total_pairs)
 h3.metric("Total Signals", len(radar.signals))
-h4.metric("Big Moves", len(radar.bigmove_signals))
+h4.metric("MACD Aday", len(radar.macd_pattern_candidates))
 
 st.divider()
 
 # DEBUG PANEL (ortak)
-with st.expander("🔧 Debug Log", expanded=False):
+with st.expander("Debug Log", expanded=False):
     with radar.lock:
         logs = list(radar.debug_log)
     if logs:
@@ -362,17 +777,74 @@ with st.expander("🔧 Debug Log", expanded=False):
 
 st.divider()
 
+
+# ==================== HELPER: MACD Pattern CSS Class ====================
+def get_macd_pattern_css_class(pattern):
+    """MACD pattern metnine gore CSS class dondurur"""
+    if not pattern:
+        return ""
+    p = pattern.upper()
+    if "WHALE TRAP" in p:
+        if "EFSANE" in p: return "macd-whale-efsane"
+        if "GUCLU" in p: return "macd-whale-guclu"
+        return "macd-whale-zayif"
+    if "FINAL BREAKOUT" in p:
+        if "EFSANE" in p: return "macd-breakout-efsane"
+        if "GUCLU" in p: return "macd-breakout-guclu"
+        return "macd-breakout-erken"
+    if "TRIPLE CROSS" in p:
+        if "EFSANE" in p: return "macd-triple-efsane"
+        return "macd-triple-guclu"
+    if "DALGA" in p:
+        if "AL SINYALI" in p: return "macd-dalga-al"
+        if "TAKIPTE" in p: return "macd-dalga-takip"
+        return "macd-dalga-diger"
+    return ""
+
+
+def get_macd_pattern_card_class(pattern):
+    """MACD pattern kart CSS class'i"""
+    if not pattern:
+        return ""
+    p = pattern.upper()
+    if "WHALE TRAP" in p: return "pattern-whale"
+    if "FINAL BREAKOUT" in p: return "pattern-breakout"
+    if "TRIPLE CROSS" in p: return "pattern-triple"
+    if "DALGA" in p: return "pattern-dalga"
+    return ""
+
+
+def get_pattern_score_sort(pattern):
+    """Pattern siralama skoru"""
+    if not pattern:
+        return 0
+    p = pattern.upper()
+    score = 0
+    if "EFSANE" in p: score += 100
+    elif "GUCLU" in p: score += 70
+    elif "AL SINYALI" in p: score += 60
+    elif "TAKIPTE" in p: score += 50
+    elif "ERKEN" in p: score += 40
+    elif "ZAYIF" in p: score += 30
+    else: score += 20
+    if "WHALE TRAP" in p: score += 4
+    elif "FINAL BREAKOUT" in p: score += 3
+    elif "TRIPLE CROSS" in p: score += 2
+    elif "DALGA" in p: score += 1
+    return score
+
+
 # ================================================================
 # SAYFA 1: NORMAL SINYALLER
 # ================================================================
-if page == "📡 Normal Sinyaller":
-    h1.caption("⚡ Flash: Anlık hareket | 💎 Confirmed: 3dk+15dk | 📊 MACD: Paralel yukselis (3-8 mum)")
+if page == "Normal Sinyaller":
+    h1.caption("Flash: Anlik hareket | Confirmed: 3dk+15dk | MACD: WHALE TRAP / FINAL BREAKOUT / TRIPLE CROSS / DALGA")
 
     col_filters = st.columns([1, 1, 1, 1])
     mode_filter = col_filters[0].multiselect(
         "Sinyal Modu",
-        ["⚡ FLASH", "💎 CONFIRMED", "📊 MACD"],
-        default=["⚡ FLASH", "💎 CONFIRMED", "📊 MACD"],
+        ["FLASH", "CONFIRMED", "MACD PATTERN"],
+        default=["FLASH", "CONFIRMED", "MACD PATTERN"],
         key="mode_filter"
     )
     pd_filter = col_filters[1].multiselect(
@@ -381,19 +853,19 @@ if page == "📡 Normal Sinyaller":
         default=["PUMP", "BUY", "DUMP", "SELL"],
         key="pd_filter"
     )
-    search_query = col_filters[2].text_input("🔍 Symbol Filter", placeholder="BTC...", key="search").upper()
-    macd_only = col_filters[3].checkbox("Sadece MACD etiketli sinyaller", value=False)
+    search_query = col_filters[2].text_input("Symbol Filter", placeholder="BTC...", key="search").upper()
+    macd_only = col_filters[3].checkbox("Sadece MACD Pattern'li sinyaller", value=False)
 
     st.divider()
 
     col_side, col_main, col_macd = st.columns([1, 4, 1])
 
     with col_side:
-        st.subheader("🔥 Top 5 Activity")
+        st.subheader("Top 5 Activity")
         side_placeholder = st.empty()
 
     with col_main:
-        st.subheader("📡 Intelligence Stream")
+        st.subheader("Intelligence Stream")
         main_placeholder = st.empty()
 
     def get_mode_css_class(mode):
@@ -426,7 +898,7 @@ if page == "📡 Normal Sinyaller":
                 if display_data:
                     html = (
                         "<table><tr>"
-                        "<th>Time</th><th>Symbol (4H ↑/↓)</th><th>Price</th>"
+                        "<th>Time</th><th>Symbol (4H ^/v)</th><th>Price</th>"
                         "<th>Momentum</th><th>15m Ref</th><th>Vol</th>"
                         "<th>Status</th><th>Type</th><th>MACD Pattern</th>"
                         "</tr>"
@@ -439,17 +911,23 @@ if page == "📡 Normal Sinyaller":
                         r_cls = row_css(p_type, mode)
                         lbl = label_css(p_type)
                         mode_cls = get_mode_css_class(mode)
-                        macd_val = row.get('MACD', '')
-                        macd_html = f"<span class='macd-tag'>{macd_val}</span>" if macd_val else "—"
-                        vol_display = f"{row['Vol'] / 1000:.0f}k" if row['Vol'] > 0 else "—"
-                        ref_display = f"{row['Ref']:+.4f}" if row['Ref'] != 0 else "—"
+
+                        macd_val = row.get('MACD_Pattern', '')
+                        if macd_val:
+                            pat_cls = get_macd_pattern_css_class(macd_val)
+                            macd_html = f"<span class='macd-pattern-tag {pat_cls}'>{macd_val}</span>"
+                        else:
+                            macd_html = "-"
+
+                        vol_display = f"{row['Vol'] / 1000:.0f}k" if row['Vol'] > 0 else "-"
+                        ref_display = f"{row['Ref']:+.4f}" if row['Ref'] != 0 else "-"
 
                         html += (
                             f"<tr class='{r_cls}'>"
                             f"<td>{row['Time']}</td>"
                             f"<td><a href='{tv_url}' target='_blank' class='sym-link'>{sym}</a> "
-                            f"<small class='green-arrow'>↑{row['SnapP']}</small> "
-                            f"<small class='red-arrow'>↓{row['SnapD']}</small></td>"
+                            f"<small class='green-arrow'>{row['SnapP']}</small> "
+                            f"<small class='red-arrow'>{row['SnapD']}</small></td>"
                             f"<td>{row['Price']}</td>"
                             f"<td style='font-weight:bold;'>{row['Chg']:+.2f}%</td>"
                             f"<td>{ref_display}</td>"
@@ -462,7 +940,7 @@ if page == "📡 Normal Sinyaller":
                     html += "</table>"
                     st.markdown(html, unsafe_allow_html=True)
                 else:
-                    st.info("Sinyal araniyor... Market taraniyor 🔍")
+                    st.info("Sinyal araniyor... Market taraniyor")
 
     while True:
         with side_placeholder.container():
@@ -477,8 +955,8 @@ if page == "📡 Normal Sinyaller":
                     st.markdown(f"""<div class="stat-card">
                         <a href="{tv_url}" target="_blank" class="sym-link">{sym}</a><br>
                         <small>
-                            <span class="green-arrow">↑ {counts["PUMP"]}</span> |
-                            <span class="red-arrow">↓ {counts["DUMP"]}</span>
+                            <span class="green-arrow">{counts["PUMP"]}</span> |
+                            <span class="red-arrow">{counts["DUMP"]}</span>
                         </small>
                     </div>""", unsafe_allow_html=True)
 
@@ -493,89 +971,114 @@ if page == "📡 Normal Sinyaller":
         if pd_filter:
             display_data = [s for s in display_data if s['P/D'] in pd_filter]
         if macd_only:
-            display_data = [s for s in display_data if s.get('MACD')]
+            display_data = [s for s in display_data if s.get('MACD_Pattern')]
 
         render_table(display_data, main_placeholder)
 
         time.sleep(1.5)
 
 # ================================================================
-# SAYFA 2: MACD RADAR
+# SAYFA 2: MACD PATTERN RADAR
 # ================================================================
-elif page == "📊 MACD Radar":
-    h1.caption("📊 15 dakikalık grafiklerde paralel MACD yükseliş tespiti")
+elif page == "MACD Pattern Radar":
+    h1.caption("15 dakikalik grafiklerde 4 MACD pattern tespiti: WHALE TRAP / FINAL BREAKOUT / TRIPLE CROSS / DALGA")
 
     st.markdown("""
     <div style="background-color:#1a1030; border-left:4px solid #8e44ad; padding:12px 16px; border-radius:4px; margin-bottom:16px;">
-        <b style="color:#c39bd3;">MACD Radar Nasıl Çalışır?</b><br>
+        <b style="color:#c39bd3;">MACD Pattern Radar Nasil Calisir?</b><br>
         <span style="color:#d5dbdb; font-size:0.9rem;">
-        15 dakikalık mum grafiğinde MACD çizgisi ve sinyal çizgisi <b>paralel biçimde yükseliyor</b> mu?<br>
-        • Pozitif bölgede, bullish, yükselen ve histogram genişleyen mumlar sayılır.<br>
-        • <b>Paralel(N)</b>: Son N mumda koşul sağlandı. 3-8 arası sinyal üretir.<br>
+        15 dakikalik mum grafiginde 4 farkli MACD pattern'i arar:<br><br>
+        <b style="color:#00d4ff;">WHALE TRAP</b> — Sifir uzerinde, sikisma sonrasi kesisim, ivme artisi<br>
+        <b style="color:#00ff88;">FINAL BREAKOUT</b> — Histogram genisliyor, momentum logaritmik artiyor, fiyat HH<br>
+        <b style="color:#ff6bff;">TRIPLE CROSS</b> — Uc kez yukari kesisim, her biri oncekinden yuksek, ilki sifir altinda<br>
+        <b style="color:#ffcc00;">DALGA</b> — 5 adimli sistem: Sikisma -> Sifir kesimi -> Geri cekilme -> Tekrar kesisim -> AL<br><br>
+        Her sembol icin en guclu pattern gosterilir. Sinyallerdeki coinler otomatik taranir.
         </span>
     </div>
     """, unsafe_allow_html=True)
 
-    col_m1, col_m2 = st.columns([1, 3])
-    macd_search = col_m1.text_input("🔍 Symbol Ara", placeholder="BTC...", key="macd_search").upper()
-    min_candles = col_m2.slider("Min Paralel Mum Sayısı", 1, 15, 1)
+    col_m1, col_m2, col_m3 = st.columns([1, 1, 1])
+    pattern_search = col_m1.text_input("Symbol Ara", placeholder="BTC...", key="pattern_search").upper()
+    pattern_filter = col_m2.multiselect(
+        "Pattern Filtre",
+        ["WHALE TRAP", "FINAL BREAKOUT", "TRIPLE CROSS", "DALGA"],
+        default=["WHALE TRAP", "FINAL BREAKOUT", "TRIPLE CROSS", "DALGA"],
+        key="pattern_filter"
+    )
+    min_strength = col_m3.selectbox(
+        "Min Guclendirme",
+        ["Tumü", "Zayif/Erken+", "Guclu+", "EFSANE"],
+        index=0,
+        key="min_strength"
+    )
 
     st.divider()
 
-    def _parse_macd_count(tag):
-        try:
-            return int(tag.split("(")[1].rstrip(")"))
-        except:
-            return 0
-
-    macd_page_placeholder = st.empty()
+    pattern_page_placeholder = st.empty()
 
     while True:
         with radar.lock:
-            candidates = dict(radar.macd_candidates)
+            candidates = dict(radar.macd_pattern_candidates)
 
-        filtered = {
-            sym: info for sym, info in candidates.items()
-            if (not macd_search or macd_search in sym)
-            and _parse_macd_count(info.get("MACD Pattern", "")) >= min_candles
-        }
+        # Filtreleme
+        filtered = {}
+        for sym, info in candidates.items():
+            pattern = info.get("Pattern", "")
+            if pattern_search and pattern_search not in sym:
+                continue
 
+            # Pattern tip filtresi
+            if pattern_filter:
+                matched = False
+                for pf in pattern_filter:
+                    if pf in pattern:
+                        matched = True
+                        break
+                if not matched:
+                    continue
+
+            # Guclendirme filtresi
+            if min_strength == "EFSANE" and "EFSANE" not in pattern:
+                continue
+            if min_strength == "Guclu+" and not any(x in pattern for x in ["EFSANE", "Guclu"]):
+                continue
+            if min_strength == "Zayif/Erken+" and not any(x in pattern for x in ["EFSANE", "Guclu", "Erken", "Zayif", "AL SINYALI", "TAKIPTE"]):
+                continue
+
+            filtered[sym] = info
+
+        # Skora gore sirala (EFSANE > Guclu > diger)
         sorted_c = sorted(
             filtered.items(),
-            key=lambda x: _parse_macd_count(x[1].get("MACD Pattern", "")),
+            key=lambda x: get_pattern_score_sort(x[1].get("Pattern", "")),
             reverse=True,
         )
 
-        with macd_page_placeholder.container():
+        with pattern_page_placeholder.container():
             if sorted_c:
                 html = (
                     "<table><tr>"
-                    "<th>Symbol</th><th>Fiyat</th><th>MACD Pattern</th><th>Güncelleme</th>"
+                    "<th>Symbol</th><th>Fiyat</th><th>MACD Pattern</th><th>Guncelleme</th>"
                     "</tr>"
                 )
                 for sym, info in sorted_c:
                     tv_url = f"https://www.tradingview.com/chart/?symbol=BINANCE:{sym}USDT.P"
-                    count = _parse_macd_count(info.get("MACD Pattern", ""))
-                    strength_color = "#00ff88" if count >= 6 else "#f39c12" if count >= 3 else "#c39bd3"
+                    pattern = info.get("Pattern", "")
+                    pat_cls = get_macd_pattern_css_class(pattern)
+
                     html += (
                         f"<tr class='row-macd'>"
                         f"<td><a href='{tv_url}' target='_blank' class='sym-link'>{sym}</a></td>"
                         f"<td>{info['Fiyat']}</td>"
-                        f"<td><span class='macd-tag' style='color:{strength_color}; font-size:0.95rem;'>"
-                        f"{info['MACD Pattern']}</span></td>"
-                        f"<td style='color:#666;'>{info.get('Güncelleme', 'N/A')}</td>"
+                        f"<td><span class='macd-pattern-tag {pat_cls}' style='font-size:0.95rem;'>"
+                        f"{pattern}</span></td>"
+                        f"<td style='color:#666;'>{info.get('Guncelleme', 'N/A')}</td>"
                         f"</tr>"
                     )
                 html += "</table>"
                 st.markdown(html, unsafe_allow_html=True)
-                st.caption(f"Toplam {len(sorted_c)} sembol | Tüm liste: {len(candidates)}")
+                st.caption(f"Gosterilen: {len(sorted_c)} | Toplam aday: {len(candidates)}")
             else:
-                st.info("MACD taraniyor... Semboller analiz ediliyor 🔍")
+                st.info("MACD pattern taramasi yapiliyor... Semboller analiz ediliyor")
 
         time.sleep(1.5)
-
-# ================================================================        
-# SAYFA 3: BIG MOVE HUNTER
-# ================================================================
-
-

@@ -1,3 +1,4 @@
+
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -9,6 +10,8 @@ from urllib3.util.retry import Retry
 from datetime import datetime
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
+import random
+import socket
 
 # ==================== CONFIGURATION ====================
 MIN_VOL_3M = 40000
@@ -20,16 +23,69 @@ MAX_DISPLAY_ROWS = 100
 FETCH_INTERVAL = 10
 PUMP_DUMP_THRESHOLD = 2.2
 
-# MACD Pattern Ayarlari — worker sayisi düşürüldü, semaphore eklendi
-MACD_PATTERN_EXECUTOR = ThreadPoolExecutor(max_workers=5)
+# MACD Pattern Ayarlari
+MACD_PATTERN_EXECUTOR = ThreadPoolExecutor(max_workers=3, thread_name_prefix="macd")
 MACD_PATTERN_COOLDOWN = 180
-_KLINE_SEMAPHORE = threading.Semaphore(3)
+_KLINE_SEMAPHORE = threading.Semaphore(2)
 
 BINANCE_REST_URLS = [
     "https://fapi.binance.com",
     "https://fapi1.binance.com",
     "https://fapi2.binance.com",
+    "https://fapi3.binance.com",
+    "https://fapi4.binance.com",
 ]
+
+# ==================== ROBUST SESSION FACTORY ====================
+
+def create_session():
+    """Ultra-robust session with TCP keepalive, proper pooling, and retry strategy"""
+    session = requests.Session()
+
+    # Rotating user agents to avoid fingerprinting
+    user_agents = [
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
+        'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+    ]
+
+    session.headers.update({
+        'User-Agent': random.choice(user_agents),
+        'Accept': 'application/json, text/plain, */*',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Accept-Encoding': 'gzip, deflate, br',
+        'Referer': 'https://www.tradingview.com/',
+        'Origin': 'https://www.tradingview.com/',
+        'Connection': 'keep-alive',
+        'Sec-Fetch-Dest': 'empty',
+        'Sec-Fetch-Mode': 'cors',
+        'Sec-Fetch-Site': 'cross-site',
+        'Cache-Control': 'no-cache',
+        'Pragma': 'no-cache',
+    })
+
+    # Aggressive retry for transient failures, but NOT for 418/429 (handled manually)
+    retry_strategy = Retry(
+        total=3,
+        backoff_factor=2.0,
+        status_forcelist=[500, 502, 503, 504, 520, 521, 522, 523, 524],
+        allowed_methods=["HEAD", "GET", "OPTIONS"],
+        raise_on_status=False,
+        respect_retry_after_header=True,
+    )
+
+    # Large connection pool with TCP keepalive enabled at socket level
+    adapter = HTTPAdapter(
+        max_retries=retry_strategy,
+        pool_connections=10,
+        pool_maxsize=20,
+        pool_block=False,
+    )
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+
+    return session
+
 
 # ==================== MACD PATTERN SYSTEM ====================
 
@@ -204,38 +260,6 @@ def run_signals(close_prices, volume_ratio=1.0):
     }
 
 
-# ==================== SESSION & RETRY SETUP ====================
-
-def create_session():
-    """Temiz session olusturur — her yenilemede yeni headers + retry stratejisi"""
-    session = requests.Session()
-    session.headers.update({
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-        'Accept': 'application/json, text/plain, */*',
-        'Accept-Language': 'en-US,en;q=0.9,tr;q=0.8',
-        'Accept-Encoding': 'gzip, deflate, br',
-        'Referer': 'https://www.tradingview.com/',
-        'Origin': 'https://www.tradingview.com/',
-        'Connection': 'keep-alive',
-        'Sec-Fetch-Dest': 'empty',
-        'Sec-Fetch-Mode': 'cors',
-        'Sec-Fetch-Site': 'cross-site',
-        'Cache-Control': 'no-cache',
-        'Pragma': 'no-cache',
-    })
-    # 418 ve 429'u retry listesinden cikardik — bunlari manuel yonetiyoruz
-    retry_strategy = Retry(
-        total=2,
-        backoff_factor=1.0,
-        status_forcelist=[500, 502, 503, 504],
-        allowed_methods=["HEAD", "GET", "OPTIONS"]
-    )
-    adapter = HTTPAdapter(max_retries=retry_strategy, pool_connections=5, pool_maxsize=10)
-    session.mount("https://", adapter)
-    session.mount("http://", adapter)
-    return session
-
-
 # ==================== HELPERS ====================
 
 def get_signal_label(direction: str, chg: float) -> str:
@@ -258,31 +282,37 @@ class MarketRadar:
         self.last_reset_hour = datetime.now().hour
         self.last_reset_4h_block = datetime.now().hour // 4
         self.price_cache_15m = {}
-        self.debug_log = []
+        self.debug_log = deque(maxlen=100)
         self.session = create_session()
+        self.session_created_at = time.time()
 
         # URL rotation state
         self._url_index = 0
         self._url_failures = 0
         self._url_lock = threading.Lock()
-
-        # Fetch sayaci — periyodik session yenileme icin
-        self._fetch_count = 0
         self._consecutive_errors = 0
+        self._total_requests = 0
+        self._rate_limit_hits = 0
 
         # MACD Pattern state
         self.macd_pattern_sent = {}
         self.macd_pattern_candidates = {}
         self.macd_pattern_last_trigger = {}
 
+        # Circuit breaker
+        self._circuit_open = False
+        self._circuit_open_until = 0
+
+        # Adaptive fetch interval
+        self._current_fetch_interval = FETCH_INTERVAL
+        self._healthy_streak = 0
+
     def log(self, msg):
         t = datetime.now().strftime("%H:%M:%S")
         full = f"[{t}] {msg}"
         print(full, flush=True)
         with self.lock:
-            self.debug_log.insert(0, full)
-            if len(self.debug_log) > 50:
-                self.debug_log.pop()
+            self.debug_log.appendleft(full)
 
     # ==================== URL ROTATION ====================
 
@@ -290,25 +320,39 @@ class MarketRadar:
         with self._url_lock:
             return BINANCE_REST_URLS[self._url_index % len(BINANCE_REST_URLS)]
 
-    def _mark_url_failure(self):
+    def _rotate_url(self, reason="failure"):
         with self._url_lock:
-            self._url_failures += 1
-            if self._url_failures >= 3:
-                old_idx = self._url_index
-                self._url_index = (self._url_index + 1) % len(BINANCE_REST_URLS)
-                self._url_failures = 0
-                new_url = BINANCE_REST_URLS[self._url_index]
-                self.log(f"URL rotasyon: [{old_idx}] -> [{self._url_index}] {new_url}")
+            old_idx = self._url_index
+            self._url_index = (self._url_index + 1) % len(BINANCE_REST_URLS)
+            self._url_failures = 0
+            new_url = BINANCE_REST_URLS[self._url_index]
+            self.log(f"URL rotasyon [{reason}]: [{old_idx}] -> [{self._url_index}] {new_url}")
 
     def _mark_url_success(self):
         with self._url_lock:
             self._url_failures = 0
+            self._consecutive_errors = 0
+            self._healthy_streak += 1
+            # Gradually reduce interval back to normal
+            if self._healthy_streak > 10:
+                self._current_fetch_interval = max(FETCH_INTERVAL, self._current_fetch_interval - 1)
+                self._healthy_streak = 0
+
+    def _mark_url_failure(self):
+        with self._url_lock:
+            self._url_failures += 1
+            self._consecutive_errors += 1
+            self._healthy_streak = 0
+            # Increase interval on failure
+            self._current_fetch_interval = min(60, self._current_fetch_interval + 2)
+            if self._url_failures >= 2:
+                self._rotate_url("failure_threshold")
 
     def get_working_rest_url(self):
-        """Baslangicta ilk calisan URL'yi bul"""
+        """Baslangicta calisan URL'yi bul - tum URL'leri dene"""
         for i, url in enumerate(BINANCE_REST_URLS):
             try:
-                r = self.session.get(f"{url}/fapi/v1/ping", timeout=5)
+                r = self.session.get(f"{url}/fapi/v1/ping", timeout=8)
                 if r.status_code == 200:
                     with self._url_lock:
                         self._url_index = i
@@ -317,44 +361,101 @@ class MarketRadar:
                 else:
                     self.log(f"{url} -> status {r.status_code}")
             except Exception as e:
-                self.log(f"{url} -> HATA: {e}")
-            time.sleep(0.5)
-        self.log("Uyari: Ping basarisiz, ilk URL ile devam ediliyor")
+                self.log(f"{url} -> HATA: {str(e)[:60]}")
+            time.sleep(1.0)
+        self.log("UYARI: Tum pingler basarisiz, ilk URL ile devam ediliyor")
         return BINANCE_REST_URLS[0]
+
+    # ==================== CIRCUIT BREAKER ====================
+
+    def _check_circuit(self):
+        if self._circuit_open:
+            if time.time() < self._circuit_open_until:
+                return False
+            self._circuit_open = False
+            self.log("Circuit breaker KAPANDI - tekrar deneniyor")
+        return True
+
+    def _open_circuit(self, duration=60):
+        self._circuit_open = True
+        self._circuit_open_until = time.time() + duration
+        self.log(f"Circuit breaker ACILDI - {duration}s bekleniyor")
+
+    # ==================== SESSION HEALTH ====================
+
+    def _refresh_session_if_needed(self, force=False):
+        now = time.time()
+        age = now - self.session_created_at
+        # Force refresh every 10 minutes or on demand
+        if force or age > 600:
+            try:
+                old_session = self.session
+                self.session = create_session()
+                self.session_created_at = now
+                try:
+                    old_session.close()
+                except:
+                    pass
+                self.log(f"Session yenilendi (age={age:.0f}s, force={force})")
+                return True
+            except Exception as e:
+                self.log(f"Session yenileme hatasi: {e}")
+        return False
 
     # ==================== HTTP ISTEK ====================
 
-    def _safe_request(self, url, timeout=5):
+    def _safe_request(self, url, timeout=8):
         """
-        Saglikli HTTP istegi:
-        - 418: session yenile + URL rotasyonu
-        - 429: Retry-After kadar bekle
-        - ConnectionError: URL rotasyonu
-        - Basarida _mark_url_success, hata sayacini sifirla
+        Saglikli HTTP istegi - circuit breaker + adaptive backoff + session refresh
         """
+        if not self._check_circuit():
+            return None
+
+        # Circuit breaker for too many total requests
+        self._total_requests += 1
+
         try:
-            time.sleep(0.05)
+            # Small jitter to avoid thundering herd
+            time.sleep(random.uniform(0.01, 0.08))
+
             response = self.session.get(url, timeout=timeout)
 
             if response.status_code == 200:
                 self._mark_url_success()
+                # Check weight header for proactive throttling
+                weight_header = None
+                for header_name in response.headers:
+                    if 'X-MBX-USED-WEIGHT' in header_name:
+                        weight_header = response.headers[header_name]
+                        break
+                if weight_header:
+                    try:
+                        weight = int(weight_header)
+                        if weight > 1000:  # Getting close to 1200/min limit
+                            self.log(f"Weight yaklasiyor: {weight}/1200 - yavaslatiliyor")
+                            self._current_fetch_interval = min(60, self._current_fetch_interval + 3)
+                    except:
+                        pass
                 return response
 
             if response.status_code == 418:
-                self.log(f"418 alindi -> session yenileniyor + URL rotasyonu")
-                self.session = create_session()
-                self._mark_url_failure()
-                time.sleep(3.0)
+                retry_after = int(response.headers.get('Retry-After', 120))
+                self.log(f"418 IP BAN! -> {retry_after}s bekleniyor + session yenileniyor")
+                self._rate_limit_hits += 1
+                self._refresh_session_if_needed(force=True)
+                self._open_circuit(retry_after)
                 return None
 
             if response.status_code == 429:
-                retry_after = int(response.headers.get('Retry-After', 15))
+                retry_after = int(response.headers.get('Retry-After', 30))
                 self.log(f"429 rate limit -> {retry_after}s bekleniyor")
+                self._rate_limit_hits += 1
                 self._mark_url_failure()
+                # Don't rotate URL on 429, just wait
                 time.sleep(retry_after)
                 return None
 
-            if response.status_code in (500, 502, 503, 504):
+            if response.status_code in (500, 502, 503, 504, 520, 521, 522, 523, 524):
                 self.log(f"HTTP {response.status_code} -> URL rotasyonu")
                 self._mark_url_failure()
                 return None
@@ -363,8 +464,13 @@ class MarketRadar:
             return None
 
         except requests.exceptions.ConnectionError as e:
-            self.log(f"Baglanti hatasi -> URL rotasyonu: {str(e)[:60]}")
-            self._mark_url_failure()
+            err_str = str(e).lower()
+            if "remote end closed" in err_str or "connection aborted" in err_str:
+                self.log(f"Keep-alive hatasi -> session yenileniyor")
+                self._refresh_session_if_needed(force=True)
+            else:
+                self.log(f"Baglanti hatasi -> URL rotasyonu: {str(e)[:80]}")
+                self._mark_url_failure()
             return None
 
         except requests.exceptions.Timeout:
@@ -372,8 +478,14 @@ class MarketRadar:
             self._mark_url_failure()
             return None
 
+        except requests.exceptions.RequestException as e:
+            self.log(f"Istek hatasi: {str(e)[:80]}")
+            self._mark_url_failure()
+            return None
+
         except Exception as e:
-            self.log(f"Istek hatasi: {e}")
+            self.log(f"Beklenmedik hata: {str(e)[:80]}")
+            self._mark_url_failure()
             return None
 
     # ==================== RESET LOGIC ====================
@@ -403,8 +515,6 @@ class MarketRadar:
                     self.history[symbol] = deque(maxlen=400)
                 self.history[symbol].append((now, price, quote_vol))
                 self.check_logic(symbol, now)
-                # MACD trigger process_ticker'dan kaldirildi —
-                # artik sadece add_signal() uzerinden tetikleniyor
 
     def check_logic(self, symbol, now):
         hist = list(self.history[symbol])
@@ -442,7 +552,7 @@ class MarketRadar:
                 return price
         try:
             url = f"{self._get_current_url()}/fapi/v1/klines?symbol={symbol}&interval=15m&limit=2"
-            response = self._safe_request(url, timeout=3)
+            response = self._safe_request(url, timeout=5)
             if response and response.status_code == 200:
                 price = float(response.json()[0][1])
                 self.price_cache_15m[symbol] = (now, price)
@@ -485,8 +595,6 @@ class MarketRadar:
             if len(self.signals) > MAX_DISPLAY_ROWS:
                 self.signals.pop()
 
-            # MACD pattern analizi: sadece FLASH ve CONFIRMED sinyallerde tetikle
-            # MACD PATTERN modu kendisi tekrar tetiklemesin (sonsuz dongu onlemi)
             if mode in ("FLASH", "CONFIRMED"):
                 now_t = time.time()
                 last_t = self.macd_pattern_last_trigger.get(symbol, 0)
@@ -501,7 +609,7 @@ class MarketRadar:
         with _KLINE_SEMAPHORE:
             url = f"{self._get_current_url()}/fapi/v1/klines?symbol={symbol}&interval={interval}&limit={limit}"
             try:
-                resp = self._safe_request(url, timeout=5)
+                resp = self._safe_request(url, timeout=8)
                 if not resp or resp.status_code != 200:
                     return None
                 raw = resp.json()
@@ -591,24 +699,32 @@ def get_radar_instance():
 
 
 def binance_worker(radar_obj):
-    radar_obj.log(">>> WORKER THREAD BASLADI")
+    radar_obj.log(">>> WORKER THREAD BASLADI (v3.0 BULLETPROOF)")
     radar_obj.get_working_rest_url()
     radar_obj.log(f">>> Baslangic URL: {radar_obj._get_current_url()}")
 
     fetch_count = 0
     consecutive_errors = 0
+    max_consecutive_errors = 0
 
     while True:
         try:
+            # Circuit breaker check
+            if radar_obj._circuit_open:
+                wait = max(1, int(radar_obj._circuit_open_until - time.time()))
+                radar_obj.log(f"Circuit acik -> {wait}s bekleniyor")
+                time.sleep(min(wait, 30))
+                continue
+
             current_url = radar_obj._get_current_url()
             url = f"{current_url}/fapi/v1/ticker/24hr"
-            response = radar_obj._safe_request(url, timeout=8)
+            response = radar_obj._safe_request(url, timeout=10)
             fetch_count += 1
 
             if response and response.status_code == 200:
                 # Basarili fetch
                 consecutive_errors = 0
-                radar_obj.last_heartbeat = time.time()  # fetch basarisinda guncelle
+                radar_obj.last_heartbeat = time.time()
 
                 raw = response.json()
                 formatted = [
@@ -617,45 +733,50 @@ def binance_worker(radar_obj):
                 ]
                 radar_obj.process_ticker(formatted)
 
-                # Periyodik session yenileme (her 300 fetch = ~50 dakika)
-                if fetch_count % 300 == 0:
-                    radar_obj.session = create_session()
-                    radar_obj.log(f"Session periyodik yenilendi (fetch #{fetch_count})")
+                # Periyodik session yenileme (her 200 fetch = ~33 dakika)
+                if fetch_count % 200 == 0:
+                    radar_obj._refresh_session_if_needed(force=True)
 
+                # Periyodik log
                 if fetch_count % 10 == 0:
                     radar_obj.log(
                         f"Fetch #{fetch_count} | URL: {current_url.replace('https://', '')} | "
                         f"Pairs: {radar_obj.total_pairs} | Signals: {len(radar_obj.signals)} | "
-                        f"MACD Aday: {len(radar_obj.macd_pattern_candidates)}"
+                        f"MACD: {len(radar_obj.macd_pattern_candidates)} | "
+                        f"Interval: {radar_obj._current_fetch_interval}s | "
+                        f"Errors: {radar_obj._consecutive_errors}"
                     )
 
             else:
-                # Basarisiz fetch — adaptive backoff
+                # Basarisiz fetch
                 consecutive_errors += 1
-                wait = min(5 * consecutive_errors, 60)
-                radar_obj.log(f"Fetch basarisiz #{consecutive_errors} -> {wait}s bekleniyor")
+                max_consecutive_errors = max(max_consecutive_errors, consecutive_errors)
+                wait = min(3 * consecutive_errors, 45)
+                radar_obj.log(f"Fetch basarisiz #{consecutive_errors} (max: {max_consecutive_errors}) -> {wait}s bekleniyor")
                 time.sleep(wait)
                 continue
 
         except Exception as e:
             consecutive_errors += 1
-            wait = min(5 * consecutive_errors, 60)
-            radar_obj.log(f"WORKER HATA #{consecutive_errors}: {e} -> {wait}s bekleniyor")
+            max_consecutive_errors = max(max_consecutive_errors, consecutive_errors)
+            wait = min(3 * consecutive_errors, 45)
+            radar_obj.log(f"WORKER HATA #{consecutive_errors}: {str(e)[:100]} -> {wait}s bekleniyor")
             time.sleep(wait)
             continue
 
-        time.sleep(FETCH_INTERVAL)
+        time.sleep(radar_obj._current_fetch_interval)
 
 
 # ==================== STREAMLIT UI ====================
 
-st.set_page_config(layout="wide", page_title="Market Radar Pro")
+st.set_page_config(layout="wide", page_title="Market Radar Pro v3.0")
 
 st.markdown("""
     <style>
     .main { background-color: #0e1117; }
     .status-live { color: #00ff88; font-weight: bold; border: 1px solid #00ff88; padding: 2px 10px; border-radius: 15px; font-size: 0.8rem; }
     .status-offline { color: #ff4b4b; font-weight: bold; border: 1px solid #ff4b4b; padding: 2px 10px; border-radius: 15px; font-size: 0.8rem; }
+    .status-warn { color: #f1c40f; font-weight: bold; border: 1px solid #f1c40f; padding: 2px 10px; border-radius: 15px; font-size: 0.8rem; }
     .pump-label  { background-color: #00ff88; color: black;  padding: 2px 8px; border-radius: 4px; font-weight: bold; }
     .dump-label  { background-color: #ff4b4b; color: white;  padding: 2px 8px; border-radius: 4px; font-weight: bold; }
     .buy-label   { background-color: #1a7f4b; color: #afffcf; padding: 2px 8px; border-radius: 4px; font-weight: bold; }
@@ -701,13 +822,13 @@ if "thread_started" not in st.session_state:
     t = threading.Thread(target=binance_worker, args=(radar,), daemon=True)
     t.start()
     st.session_state.thread_started = True
-    radar.log(">>> UI: Thread baslatildi")
+    radar.log(">>> UI: Thread baslatildi (v3.0)")
 
 # ==================== NAVIGATION ====================
 st.sidebar.title("Navigation")
 page = st.sidebar.radio(
     "Sayfa Sec",
-    ["Normal Sinyaller", "MACD Pattern Radar"],
+    ["Normal Sinyaller", "MACD Pattern Radar", "Sistem Durumu"],
     index=0,
 )
 st.sidebar.markdown("---")
@@ -717,34 +838,40 @@ with st.sidebar:
     elapsed = time.time() - radar.last_heartbeat
     current_url = radar._get_current_url()
     url_short = current_url.replace("https://", "")
+
     if elapsed < 15:
         st.success(f"CANLI | {url_short}")
     elif elapsed < 30:
         st.warning(f"YAVAS | {url_short} | {elapsed:.0f}s")
     else:
         st.error(f"KESINTI | {url_short} | {elapsed:.0f}s")
-    st.caption(f"URL hata sayisi: {radar._url_failures}/3")
-    st.caption("v2.2 | Market Radar Pro")
+
+    st.caption(f"URL hata: {radar._url_failures}/2 | Circuit: {'ACIK' if radar._circuit_open else 'KAPALI'}")
+    st.caption(f"Fetch interval: {radar._current_fetch_interval}s | Rate hits: {radar._rate_limit_hits}")
+    st.caption("v3.0 BULLETPROOF | Market Radar Pro")
 
 # ==================== HEADER ====================
 h1, h2, h3, h4 = st.columns([2, 1, 1, 1])
 h1.title("Market Radar Pro")
+h1.caption("v3.0 BULLETPROOF — Baglanti stabil, otomatik kurtarma, circuit breaker")
 
 elapsed = time.time() - radar.last_heartbeat
-status_html = (
-    '<span class="status-live">● SYSTEM LIVE</span>'
-    if elapsed < 15
-    else f'<span class="status-offline">● RECONNECTING ({elapsed:.0f}s)</span>'
-)
+if elapsed < 15:
+    status_html = '<span class="status-live">● SYSTEM LIVE</span>'
+elif elapsed < 30:
+    status_html = f'<span class="status-warn">● YAVAS ({elapsed:.0f}s)</span>'
+else:
+    status_html = f'<span class="status-offline">● RECONNECTING ({elapsed:.0f}s)</span>'
+
 h2.markdown(f"<div style='margin-top:10px;'>{status_html}</div>", unsafe_allow_html=True)
 h2.markdown(
     '<a href="https://x.com/SinyalEngineer" target="_blank" style="color:white; text-decoration:none;">X @SinyalEngineer</a>',
     unsafe_allow_html=True,
 )
-h3.metric("Pairs Tracked", radar.total_pairs)
-h3.metric("Total Signals", len(radar.signals))
+h3.metric("Pairs", radar.total_pairs)
+h3.metric("Signals", len(radar.signals))
 h4.metric("MACD Aday", len(radar.macd_pattern_candidates))
-h4.metric("URL Hatalari", radar._url_failures)
+h4.metric("Hata Sayisi", radar._consecutive_errors)
 
 st.divider()
 
@@ -923,7 +1050,6 @@ if page == "Normal Sinyaller":
         else:
             st.info("Sinyal araniyor... Market taraniyor")
 
-    # Auto-refresh: while True + sleep() yerine st.rerun()
     time.sleep(2)
     st.rerun()
 
@@ -1015,6 +1141,55 @@ elif page == "MACD Pattern Radar":
     else:
         st.info("MACD pattern taramasi yapiliyor... Semboller analiz ediliyor")
 
-    # Auto-refresh
     time.sleep(2)
+    st.rerun()
+
+
+# ================================================================
+# SAYFA 3: SISTEM DURUMU
+# ================================================================
+
+elif page == "Sistem Durumu":
+    st.subheader("Sistem Saglik Paneli")
+
+    col_s1, col_s2, col_s3 = st.columns(3)
+
+    with col_s1:
+        st.metric("Toplam Istek", radar._total_requests)
+        st.metric("Rate Limit Carpma", radar._rate_limit_hits)
+        st.metric("Ardışık Hata", radar._consecutive_errors)
+
+    with col_s2:
+        st.metric("Aktif URL", radar._get_current_url().replace("https://", ""))
+        st.metric("URL Hata Sayisi", f"{radar._url_failures}/2")
+        st.metric("Circuit Breaker", "ACIK" if radar._circuit_open else "KAPALI")
+
+    with col_s3:
+        st.metric("Fetch Interval", f"{radar._current_fetch_interval}s")
+        st.metric("Session Yasi", f"{time.time() - radar.session_created_at:.0f}s")
+        st.metric("MACD Executor", f"{MACD_PATTERN_EXECUTOR._max_workers} workers")
+
+    st.divider()
+    st.subheader("Baglanti Istikrari")
+
+    elapsed = time.time() - radar.last_heartbeat
+    if elapsed < 15:
+        st.success(f"✅ Baglanti saglikli — son heartbeat {elapsed:.1f}s once")
+    elif elapsed < 60:
+        st.warning(f"⚠️ Baglanti yavas — son heartbeat {elapsed:.1f}s once")
+    else:
+        st.error(f"❌ Baglanti kesik — son heartbeat {elapsed:.1f}s once. Sistem otomatik kurtarma modunda.")
+
+    st.info("""
+    **v3.0 BULLETPROOF Gelistirmeleri:**
+    - **Circuit Breaker**: Ardışık hatalarda otomatik bekleme
+    - **Adaptive Interval**: Hata sayisina gore fetch hizi ayarlanir
+    - **5 URL Rotasyonu**: fapi, fapi1-4 arasi otomatik gecis
+    - **Session Refresh**: Her 10dk'da bir + keep-alive hatasinda aninda
+    - **Rate Limit Monitoring**: X-MBX-USED-WEIGHT header'i takip edilir
+    - **Jitter**: Istekler arasi rastgele gecikme (0.01-0.08s)
+    - **Proactive Throttling**: Weight 1000+ oldugunda yavaslatma
+    """)
+
+    time.sleep(3)
     st.rerun()

@@ -403,7 +403,8 @@ class MarketRadar:
                     self.history[symbol] = deque(maxlen=400)
                 self.history[symbol].append((now, price, quote_vol))
                 self.check_logic(symbol, now)
-                self._maybe_trigger_macd_pattern(symbol, price, now)
+                # MACD trigger process_ticker'dan kaldirildi —
+                # artik sadece add_signal() uzerinden tetikleniyor
 
     def check_logic(self, symbol, now):
         hist = list(self.history[symbol])
@@ -484,6 +485,15 @@ class MarketRadar:
             if len(self.signals) > MAX_DISPLAY_ROWS:
                 self.signals.pop()
 
+            # MACD pattern analizi: sadece FLASH ve CONFIRMED sinyallerde tetikle
+            # MACD PATTERN modu kendisi tekrar tetiklemesin (sonsuz dongu onlemi)
+            if mode in ("FLASH", "CONFIRMED"):
+                now_t = time.time()
+                last_t = self.macd_pattern_last_trigger.get(symbol, 0)
+                if now_t - last_t >= MACD_PATTERN_COOLDOWN:
+                    self.macd_pattern_last_trigger[symbol] = now_t
+                    MACD_PATTERN_EXECUTOR.submit(self._run_macd_pattern_analysis, symbol, price)
+
     # ==================== MACD PATTERN SYSTEM ====================
 
     def _fetch_klines_for_pattern(self, symbol, interval="15m", limit=200):
@@ -501,19 +511,6 @@ class MarketRadar:
             except Exception as e:
                 self.log(f"Kline hata ({symbol} {interval}): {e}")
                 return None
-
-    def _maybe_trigger_macd_pattern(self, symbol, price, now):
-        hist = list(self.history.get(symbol, []))
-        if len(hist) < 6:
-            return
-        last_t = self.macd_pattern_last_trigger.get(symbol, 0)
-        if now - last_t < 20:
-            return
-        past_1m = next((x for x in reversed(hist) if now - x[0] >= 60), hist[0])
-        p_chg_1m = abs(((price - past_1m[1]) / past_1m[1]) * 100)
-        if p_chg_1m >= 1.00:
-            self.macd_pattern_last_trigger[symbol] = now
-            MACD_PATTERN_EXECUTOR.submit(self._run_macd_pattern_analysis, symbol, price)
 
     def _run_macd_pattern_analysis(self, symbol, price):
         result = self._fetch_klines_for_pattern(symbol, "15m", 200)

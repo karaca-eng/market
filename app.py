@@ -1,4 +1,3 @@
-
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -23,8 +22,6 @@ MAX_DISPLAY_ROWS = 100
 FETCH_INTERVAL = 10
 PUMP_DUMP_THRESHOLD = 2.2
 
-# MACD Pattern Ayarlari
-MACD_PATTERN_EXECUTOR = ThreadPoolExecutor(max_workers=3, thread_name_prefix="macd")
 MACD_PATTERN_COOLDOWN = 180
 _KLINE_SEMAPHORE = threading.Semaphore(2)
 
@@ -36,69 +33,50 @@ BINANCE_REST_URLS = [
     "https://fapi4.binance.com",
 ]
 
-# ==================== ROBUST SESSION FACTORY ====================
+# ==================== SESSION FACTORY ====================
 
 def create_session():
-    """Ultra-robust session with TCP keepalive, proper pooling, and retry strategy"""
     session = requests.Session()
-
-    # Rotating user agents to avoid fingerprinting
     user_agents = [
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
-        'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36',
+        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/123.0.0.0 Safari/537.36',
+        'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36',
     ]
-
     session.headers.update({
         'User-Agent': random.choice(user_agents),
-        'Accept': 'application/json, text/plain, */*',
-        'Accept-Language': 'en-US,en;q=0.9',
+        'Accept': 'application/json',
         'Accept-Encoding': 'gzip, deflate, br',
-        'Referer': 'https://www.tradingview.com/',
-        'Origin': 'https://www.tradingview.com/',
         'Connection': 'keep-alive',
-        'Sec-Fetch-Dest': 'empty',
-        'Sec-Fetch-Mode': 'cors',
-        'Sec-Fetch-Site': 'cross-site',
         'Cache-Control': 'no-cache',
-        'Pragma': 'no-cache',
     })
-
-    # Aggressive retry for transient failures, but NOT for 418/429 (handled manually)
     retry_strategy = Retry(
-        total=3,
-        backoff_factor=2.0,
-        status_forcelist=[500, 502, 503, 504, 520, 521, 522, 523, 524],
-        allowed_methods=["HEAD", "GET", "OPTIONS"],
+        total=2,
+        backoff_factor=1.5,
+        status_forcelist=[500, 502, 503, 504],
+        allowed_methods=["GET"],
         raise_on_status=False,
-        respect_retry_after_header=True,
+        respect_retry_after_header=False,  # Manuel yönetiyoruz
     )
-
-    # Large connection pool with TCP keepalive enabled at socket level
     adapter = HTTPAdapter(
         max_retries=retry_strategy,
-        pool_connections=10,
-        pool_maxsize=20,
+        pool_connections=5,
+        pool_maxsize=10,
         pool_block=False,
     )
     session.mount("https://", adapter)
-    session.mount("http://", adapter)
-
     return session
 
 
-# ==================== MACD PATTERN SYSTEM ====================
+# ==================== MACD HESAPLAMALARI ====================
 
 def calculate_macd(close_prices, fast=12, slow=26, signal=9):
     close = np.array(close_prices, dtype=float)
-
     def ema(data, span):
         k = 2 / (span + 1)
         result = [data[0]]
         for price in data[1:]:
             result.append(price * k + result[-1] * (1 - k))
         return np.array(result)
-
     exp1 = ema(close, fast)
     exp2 = ema(close, slow)
     macd = exp1 - exp2
@@ -172,7 +150,7 @@ def detect_triple_cross(m, s):
     accelerating = diff2 > diff1 > 0
     levels = f"[{c3['level']:.6f}->{c2['level']:.6f}->{c1['level']:.6f}]"
     if accelerating: return f"TRIPLE CROSS — EFSANE {levels}"
-    else: return f"TRIPLE CROSS — Guclu {levels}"
+    return f"TRIPLE CROSS — Guclu {levels}"
 
 
 def detect_dalga(m, s):
@@ -260,15 +238,13 @@ def run_signals(close_prices, volume_ratio=1.0):
     }
 
 
-# ==================== HELPERS ====================
-
 def get_signal_label(direction: str, chg: float) -> str:
     if abs(chg) >= PUMP_DUMP_THRESHOLD:
         return "PUMP" if direction == "up" else "DUMP"
     return "BUY" if direction == "up" else "SELL"
 
 
-# ==================== CORE CLASS ====================
+# ==================== ANA SINIF ====================
 
 class MarketRadar:
     def __init__(self):
@@ -286,7 +262,6 @@ class MarketRadar:
         self.session = create_session()
         self.session_created_at = time.time()
 
-        # URL rotation state
         self._url_index = 0
         self._url_failures = 0
         self._url_lock = threading.Lock()
@@ -294,7 +269,6 @@ class MarketRadar:
         self._total_requests = 0
         self._rate_limit_hits = 0
 
-        # MACD Pattern state
         self.macd_pattern_sent = {}
         self.macd_pattern_candidates = {}
         self.macd_pattern_last_trigger = {}
@@ -302,10 +276,18 @@ class MarketRadar:
         # Circuit breaker
         self._circuit_open = False
         self._circuit_open_until = 0
+        self._circuit_event = threading.Event()  # YENİ: sleep interrupt için
 
         # Adaptive fetch interval
         self._current_fetch_interval = FETCH_INTERVAL
         self._healthy_streak = 0
+
+        # YENİ: Thread watchdog
+        self._worker_thread = None
+        self._stop_event = threading.Event()
+
+        # YENİ: MACD executor (instance'a taşındı, yönetilebilir)
+        self._macd_executor = ThreadPoolExecutor(max_workers=3, thread_name_prefix="macd")
 
     def log(self, msg):
         t = datetime.now().strftime("%H:%M:%S")
@@ -314,7 +296,36 @@ class MarketRadar:
         with self.lock:
             self.debug_log.appendleft(full)
 
-    # ==================== URL ROTATION ====================
+    # ==================== THREAD WATCHDOG ====================
+
+    def ensure_worker_running(self):
+        """
+        Her UI refresh'te çağrılır.
+        Thread ölmüşse temiz şekilde yeniden başlatır.
+        """
+        if self._worker_thread is None or not self._worker_thread.is_alive():
+            self.log(">>> WATCHDOG: Worker thread yok veya ölü — yeniden başlatılıyor")
+            self._stop_event.clear()
+            self._circuit_event.clear()
+            # Yeni session aç (eski bağlantılar kirli olabilir)
+            self._refresh_session_if_needed(force=True)
+            t = threading.Thread(
+                target=self._worker_loop,
+                name="MarketRadarWorker",
+                daemon=True,
+            )
+            t.start()
+            self._worker_thread = t
+            self.log(f">>> WATCHDOG: Thread başlatıldı (id={t.ident})")
+            return True
+        return False
+
+    def stop_worker(self):
+        """Graceful shutdown"""
+        self._stop_event.set()
+        self._circuit_event.set()  # Uyuyan thread'i uyandır
+
+    # ==================== URL YÖNETİMİ ====================
 
     def _get_current_url(self):
         with self._url_lock:
@@ -333,7 +344,6 @@ class MarketRadar:
             self._url_failures = 0
             self._consecutive_errors = 0
             self._healthy_streak += 1
-            # Gradually reduce interval back to normal
             if self._healthy_streak > 10:
                 self._current_fetch_interval = max(FETCH_INTERVAL, self._current_fetch_interval - 1)
                 self._healthy_streak = 0
@@ -343,50 +353,64 @@ class MarketRadar:
             self._url_failures += 1
             self._consecutive_errors += 1
             self._healthy_streak = 0
-            # Increase interval on failure
             self._current_fetch_interval = min(60, self._current_fetch_interval + 2)
             if self._url_failures >= 2:
                 self._rotate_url("failure_threshold")
 
     def get_working_rest_url(self):
-        """Baslangicta calisan URL'yi bul - tum URL'leri dene"""
         for i, url in enumerate(BINANCE_REST_URLS):
             try:
-                r = self.session.get(f"{url}/fapi/v1/ping", timeout=8)
+                r = self.session.get(f"{url}/fapi/v1/ping", timeout=6)
                 if r.status_code == 200:
                     with self._url_lock:
                         self._url_index = i
-                    self.log(f"Baslangic URL: {url}")
+                    self.log(f"Başlangıç URL: {url}")
                     return url
                 else:
                     self.log(f"{url} -> status {r.status_code}")
             except Exception as e:
                 self.log(f"{url} -> HATA: {str(e)[:60]}")
-            time.sleep(1.0)
-        self.log("UYARI: Tum pingler basarisiz, ilk URL ile devam ediliyor")
+            time.sleep(0.5)
+        self.log("UYARI: Tüm pingler başarısız, ilk URL ile devam ediliyor")
         return BINANCE_REST_URLS[0]
 
     # ==================== CIRCUIT BREAKER ====================
 
     def _check_circuit(self):
         if self._circuit_open:
-            if time.time() < self._circuit_open_until:
+            remaining = self._circuit_open_until - time.time()
+            if remaining > 0:
                 return False
             self._circuit_open = False
-            self.log("Circuit breaker KAPANDI - tekrar deneniyor")
+            self._circuit_event.clear()
+            self.log("Circuit breaker KAPANDI")
         return True
 
     def _open_circuit(self, duration=60):
         self._circuit_open = True
         self._circuit_open_until = time.time() + duration
-        self.log(f"Circuit breaker ACILDI - {duration}s bekleniyor")
+        self._circuit_event.set()  # _interruptible_sleep'i uyandır
+        self.log(f"Circuit breaker AÇILDI — {duration}s bekleniyor")
 
-    # ==================== SESSION HEALTH ====================
+    def _interruptible_sleep(self, seconds):
+        """
+        time.sleep() yerine kullan — stop_event veya circuit_event ile
+        kesilebilir. Thread donmaz.
+        """
+        deadline = time.time() + seconds
+        while time.time() < deadline:
+            if self._stop_event.is_set():
+                return
+            remaining = deadline - time.time()
+            # max 1 saniyelik dilimler halinde uyu
+            self._circuit_event.wait(timeout=min(1.0, remaining))
+            self._circuit_event.clear()
+
+    # ==================== SESSION YÖNETİMİ ====================
 
     def _refresh_session_if_needed(self, force=False):
         now = time.time()
         age = now - self.session_created_at
-        # Force refresh every 10 minutes or on demand
         if force or age > 600:
             try:
                 old_session = self.session
@@ -394,53 +418,46 @@ class MarketRadar:
                 self.session_created_at = now
                 try:
                     old_session.close()
-                except:
+                except Exception:
                     pass
                 self.log(f"Session yenilendi (age={age:.0f}s, force={force})")
                 return True
             except Exception as e:
-                self.log(f"Session yenileme hatasi: {e}")
+                self.log(f"Session yenileme hatası: {e}")
         return False
 
-    # ==================== HTTP ISTEK ====================
+    # ==================== HTTP İSTEK ====================
 
     def _safe_request(self, url, timeout=8):
-        """
-        Saglikli HTTP istegi - circuit breaker + adaptive backoff + session refresh
-        """
+        if self._stop_event.is_set():
+            return None
         if not self._check_circuit():
             return None
 
-        # Circuit breaker for too many total requests
         self._total_requests += 1
 
         try:
-            # Small jitter to avoid thundering herd
-            time.sleep(random.uniform(0.01, 0.08))
-
+            time.sleep(random.uniform(0.01, 0.06))
             response = self.session.get(url, timeout=timeout)
 
             if response.status_code == 200:
                 self._mark_url_success()
-                # Check weight header for proactive throttling
-                weight_header = None
-                for header_name in response.headers:
-                    if 'X-MBX-USED-WEIGHT' in header_name:
-                        weight_header = response.headers[header_name]
+                # Weight header kontrolü
+                for header_name, val in response.headers.items():
+                    if 'X-MBX-USED-WEIGHT' in header_name.upper():
+                        try:
+                            weight = int(val)
+                            if weight > 1000:
+                                self.log(f"Weight yüksek: {weight}/1200 — yavaşlatılıyor")
+                                self._current_fetch_interval = min(60, self._current_fetch_interval + 3)
+                        except ValueError:
+                            pass
                         break
-                if weight_header:
-                    try:
-                        weight = int(weight_header)
-                        if weight > 1000:  # Getting close to 1200/min limit
-                            self.log(f"Weight yaklasiyor: {weight}/1200 - yavaslatiliyor")
-                            self._current_fetch_interval = min(60, self._current_fetch_interval + 3)
-                    except:
-                        pass
                 return response
 
             if response.status_code == 418:
                 retry_after = int(response.headers.get('Retry-After', 120))
-                self.log(f"418 IP BAN! -> {retry_after}s bekleniyor + session yenileniyor")
+                self.log(f"418 IP BAN! {retry_after}s — session yenileniyor")
                 self._rate_limit_hits += 1
                 self._refresh_session_if_needed(force=True)
                 self._open_circuit(retry_after)
@@ -448,15 +465,13 @@ class MarketRadar:
 
             if response.status_code == 429:
                 retry_after = int(response.headers.get('Retry-After', 30))
-                self.log(f"429 rate limit -> {retry_after}s bekleniyor")
+                self.log(f"429 Rate limit — {retry_after}s bekleniyor")
                 self._rate_limit_hits += 1
-                self._mark_url_failure()
-                # Don't rotate URL on 429, just wait
-                time.sleep(retry_after)
+                self._interruptible_sleep(retry_after)
                 return None
 
             if response.status_code in (500, 502, 503, 504, 520, 521, 522, 523, 524):
-                self.log(f"HTTP {response.status_code} -> URL rotasyonu")
+                self.log(f"HTTP {response.status_code} — URL rotasyonu")
                 self._mark_url_failure()
                 return None
 
@@ -466,20 +481,20 @@ class MarketRadar:
         except requests.exceptions.ConnectionError as e:
             err_str = str(e).lower()
             if "remote end closed" in err_str or "connection aborted" in err_str:
-                self.log(f"Keep-alive hatasi -> session yenileniyor")
+                self.log("Keep-alive hatası — session yenileniyor")
                 self._refresh_session_if_needed(force=True)
             else:
-                self.log(f"Baglanti hatasi -> URL rotasyonu: {str(e)[:80]}")
+                self.log(f"Bağlantı hatası: {str(e)[:80]}")
                 self._mark_url_failure()
             return None
 
         except requests.exceptions.Timeout:
-            self.log(f"Timeout -> URL rotasyonu")
+            self.log("Timeout — URL rotasyonu")
             self._mark_url_failure()
             return None
 
         except requests.exceptions.RequestException as e:
-            self.log(f"Istek hatasi: {str(e)[:80]}")
+            self.log(f"İstek hatası: {str(e)[:80]}")
             self._mark_url_failure()
             return None
 
@@ -488,7 +503,7 @@ class MarketRadar:
             self._mark_url_failure()
             return None
 
-    # ==================== RESET LOGIC ====================
+    # ==================== RESET LOJİĞİ ====================
 
     def check_resets(self):
         now = datetime.now()
@@ -499,7 +514,18 @@ class MarketRadar:
             self.stats_4h.clear()
             self.last_reset_4h_block = now.hour // 4
 
-    # ==================== TICKER ISLEME ====================
+    # ==================== 15M CACHE TEMİZLİĞİ ====================
+
+    def _clean_15m_cache(self):
+        """Eski cache kayıtlarını sil — bellek sızıntısını önler"""
+        now = time.time()
+        expired = [k for k, (t, _) in self.price_cache_15m.items() if now - t > 600]
+        for k in expired:
+            del self.price_cache_15m[k]
+        if expired:
+            self.log(f"15m cache temizlendi: {len(expired)} kayıt silindi")
+
+    # ==================== TICKER İŞLEME ====================
 
     def process_ticker(self, data):
         now = time.time()
@@ -590,7 +616,7 @@ class MarketRadar:
                 "SnapD": self.stats_4h[sym_clean]["DUMP"],
                 "MACD_Pattern": macd_pattern or "",
             })
-            self.log(f"SINYAL: {sym_clean} {s_type} {mode} {chg_main:+.2f}%" +
+            self.log(f"SİNYAL: {sym_clean} {s_type} {mode} {chg_main:+.2f}%" +
                      (f" | {macd_pattern}" if macd_pattern else ""))
             if len(self.signals) > MAX_DISPLAY_ROWS:
                 self.signals.pop()
@@ -600,12 +626,14 @@ class MarketRadar:
                 last_t = self.macd_pattern_last_trigger.get(symbol, 0)
                 if now_t - last_t >= MACD_PATTERN_COOLDOWN:
                     self.macd_pattern_last_trigger[symbol] = now_t
-                    MACD_PATTERN_EXECUTOR.submit(self._run_macd_pattern_analysis, symbol, price)
+                    try:
+                        self._macd_executor.submit(self._run_macd_pattern_analysis, symbol, price)
+                    except RuntimeError:
+                        self.log("MACD executor kapalı — görev atlandı")
 
-    # ==================== MACD PATTERN SYSTEM ====================
+    # ==================== MACD PATTERN ANALİZİ ====================
 
     def _fetch_klines_for_pattern(self, symbol, interval="15m", limit=200):
-        """Semaphore ile throttle edilmis kline cekimi"""
         with _KLINE_SEMAPHORE:
             url = f"{self._get_current_url()}/fapi/v1/klines?symbol={symbol}&interval={interval}&limit={limit}"
             try:
@@ -617,10 +645,12 @@ class MarketRadar:
                 volumes = [float(c[5]) for c in raw]
                 return closes, volumes
             except Exception as e:
-                self.log(f"Kline hata ({symbol} {interval}): {e}")
+                self.log(f"Kline hatası ({symbol} {interval}): {e}")
                 return None
 
     def _run_macd_pattern_analysis(self, symbol, price):
+        if self._stop_event.is_set():
+            return
         result = self._fetch_klines_for_pattern(symbol, "15m", 200)
         if result is None:
             return
@@ -637,26 +667,23 @@ class MarketRadar:
         now = time.time()
         best_pattern = None
         best_score = 0
-        best_key = None
         for key, value in signals.items():
             if value is None:
                 continue
             score = 0
             if "EFSANE" in value: score = 100
             elif "Guclu" in value: score = 70
-            elif "Erken" in value or "Zayif" in value or "TAKIPTE" in value or "AL SINYALI" in value: score = 50
+            elif any(x in value for x in ["Erken", "Zayif", "TAKIPTE", "AL SINYALI"]): score = 50
             elif any(x in value for x in ["Sikisma", "Sifir Ustu", "Geri Cekildi"]): score = 30
             if score > best_score:
                 best_score = score
                 best_pattern = value
-                best_key = key
         with self.lock:
             if best_pattern:
                 self.macd_pattern_candidates[sym_clean] = {
                     "Sembol": sym_clean,
                     "Fiyat": f"{price:.4f}" if price < 1 else f"{price:.2f}",
                     "Pattern": best_pattern,
-                    "PatternTip": best_key or "",
                     "Guncelleme": datetime.now().strftime("%H:%M:%S"),
                 }
                 if now - self.macd_pattern_sent.get(sym_clean, 0) < MACD_PATTERN_COOLDOWN:
@@ -675,101 +702,93 @@ class MarketRadar:
                             break
                     if not updated:
                         self.add_signal(
-                            symbol=symbol,
-                            price=price,
-                            chg_main=0.0,
-                            chg_ref=0.0,
-                            vol=0,
-                            s_type="BUY",
-                            mode="MACD PATTERN",
-                            score=60,
-                            macd_pattern=best_pattern,
+                            symbol=symbol, price=price,
+                            chg_main=0.0, chg_ref=0.0, vol=0,
+                            s_type="BUY", mode="MACD PATTERN",
+                            score=60, macd_pattern=best_pattern,
                         )
-                        self.log(f"MACD PATTERN SINYAL: {sym_clean} {best_pattern}")
             else:
-                if sym_clean in self.macd_pattern_candidates:
-                    del self.macd_pattern_candidates[sym_clean]
+                self.macd_pattern_candidates.pop(sym_clean, None)
+
+    # ==================== WORKER LOOP ====================
+
+    def _worker_loop(self):
+        """
+        Tek sorumluluk: Binance'ten veri çek, işle, uy.
+        Exception ne olursa olsun döngü kırılmaz.
+        Thread watchdog bu methodu çağırır.
+        """
+        self.log(">>> WORKER LOOP BAŞLADI (v4.0)")
+        self.get_working_rest_url()
+
+        fetch_count = 0
+        cache_clean_counter = 0
+
+        while not self._stop_event.is_set():
+            try:
+                # Circuit breaker aktifse interrupt edilebilir şekilde bekle
+                if self._circuit_open:
+                    remaining = max(1, int(self._circuit_open_until - time.time()))
+                    self.log(f"Circuit açık — {remaining}s bekleniyor (kesilebilir)")
+                    self._interruptible_sleep(remaining)
+                    continue
+
+                current_url = self._get_current_url()
+                url = f"{current_url}/fapi/v1/ticker/24hr"
+                response = self._safe_request(url, timeout=10)
+                fetch_count += 1
+                cache_clean_counter += 1
+
+                if response and response.status_code == 200:
+                    self.last_heartbeat = time.time()
+                    raw = response.json()
+                    formatted = [
+                        {'s': x['symbol'], 'c': x['lastPrice'], 'q': x['quoteVolume']}
+                        for x in raw
+                    ]
+                    self.process_ticker(formatted)
+
+                    # Periyodik görevler
+                    if fetch_count % 200 == 0:
+                        self._refresh_session_if_needed(force=True)
+                    if cache_clean_counter >= 30:
+                        self._clean_15m_cache()
+                        cache_clean_counter = 0
+                    if fetch_count % 10 == 0:
+                        self.log(
+                            f"Fetch #{fetch_count} | {current_url.replace('https://', '')} | "
+                            f"Pairs:{self.total_pairs} Signals:{len(self.signals)} "
+                            f"MACD:{len(self.macd_pattern_candidates)} "
+                            f"Interval:{self._current_fetch_interval}s"
+                        )
+
+                    self._interruptible_sleep(self._current_fetch_interval)
+
+                else:
+                    # Başarısız fetch — kısa exponential backoff
+                    wait = min(3 * (self._consecutive_errors + 1), 45)
+                    self.log(f"Fetch başarısız — {wait}s bekleniyor")
+                    self._interruptible_sleep(wait)
+
+            except Exception as e:
+                # Hiçbir şey thread'i öldüremez
+                wait = min(5 * (self._consecutive_errors + 1), 60)
+                self.log(f"WORKER İSTİSNA (döngü devam): {str(e)[:120]} — {wait}s bekle")
+                self._interruptible_sleep(wait)
+
+        self.log(">>> WORKER LOOP DURDU (stop_event)")
 
 
-# ==================== WORKER ====================
+# ==================== STREAMLIT CACHE ====================
 
 @st.cache_resource
 def get_radar_instance():
     return MarketRadar()
 
 
-def binance_worker(radar_obj):
-    radar_obj.log(">>> WORKER THREAD BASLADI (v3.0 BULLETPROOF)")
-    radar_obj.get_working_rest_url()
-    radar_obj.log(f">>> Baslangic URL: {radar_obj._get_current_url()}")
-
-    fetch_count = 0
-    consecutive_errors = 0
-    max_consecutive_errors = 0
-
-    while True:
-        try:
-            # Circuit breaker check
-            if radar_obj._circuit_open:
-                wait = max(1, int(radar_obj._circuit_open_until - time.time()))
-                radar_obj.log(f"Circuit acik -> {wait}s bekleniyor")
-                time.sleep(min(wait, 30))
-                continue
-
-            current_url = radar_obj._get_current_url()
-            url = f"{current_url}/fapi/v1/ticker/24hr"
-            response = radar_obj._safe_request(url, timeout=10)
-            fetch_count += 1
-
-            if response and response.status_code == 200:
-                # Basarili fetch
-                consecutive_errors = 0
-                radar_obj.last_heartbeat = time.time()
-
-                raw = response.json()
-                formatted = [
-                    {'s': x['symbol'], 'c': x['lastPrice'], 'q': x['quoteVolume']}
-                    for x in raw
-                ]
-                radar_obj.process_ticker(formatted)
-
-                # Periyodik session yenileme (her 200 fetch = ~33 dakika)
-                if fetch_count % 200 == 0:
-                    radar_obj._refresh_session_if_needed(force=True)
-
-                # Periyodik log
-                if fetch_count % 10 == 0:
-                    radar_obj.log(
-                        f"Fetch #{fetch_count} | URL: {current_url.replace('https://', '')} | "
-                        f"Pairs: {radar_obj.total_pairs} | Signals: {len(radar_obj.signals)} | "
-                        f"MACD: {len(radar_obj.macd_pattern_candidates)} | "
-                        f"Interval: {radar_obj._current_fetch_interval}s | "
-                        f"Errors: {radar_obj._consecutive_errors}"
-                    )
-
-            else:
-                # Basarisiz fetch
-                consecutive_errors += 1
-                max_consecutive_errors = max(max_consecutive_errors, consecutive_errors)
-                wait = min(3 * consecutive_errors, 45)
-                radar_obj.log(f"Fetch basarisiz #{consecutive_errors} (max: {max_consecutive_errors}) -> {wait}s bekleniyor")
-                time.sleep(wait)
-                continue
-
-        except Exception as e:
-            consecutive_errors += 1
-            max_consecutive_errors = max(max_consecutive_errors, consecutive_errors)
-            wait = min(3 * consecutive_errors, 45)
-            radar_obj.log(f"WORKER HATA #{consecutive_errors}: {str(e)[:100]} -> {wait}s bekleniyor")
-            time.sleep(wait)
-            continue
-
-        time.sleep(radar_obj._current_fetch_interval)
-
-
 # ==================== STREAMLIT UI ====================
 
-st.set_page_config(layout="wide", page_title="Market Radar Pro v3.0")
+st.set_page_config(layout="wide", page_title="Market Radar Pro v4.0")
 
 st.markdown("""
     <style>
@@ -784,10 +803,7 @@ st.markdown("""
     .mode-confirmed { background-color: #1abc9c; color: #fff; padding: 2px 8px; border-radius: 4px; font-weight: bold; }
     .mode-flash { background-color: #e67e22; color: #fff; padding: 2px 8px; border-radius: 4px; font-weight: bold; }
     .mode-macd  { background-color: #8e44ad; color: #fff; padding: 2px 8px; border-radius: 4px; font-weight: bold; }
-    .macd-pattern-tag {
-        padding: 2px 8px; border-radius: 4px; font-size: 0.78rem; font-weight: bold;
-        display: inline-block; white-space: nowrap;
-    }
+    .macd-pattern-tag { padding: 2px 8px; border-radius: 4px; font-size: 0.78rem; font-weight: bold; display: inline-block; white-space: nowrap; }
     .macd-whale-efsane { background-color: #1a3a4a; color: #00d4ff; border: 1px solid #00d4ff; }
     .macd-whale-guclu { background-color: #1a2a3a; color: #4db8ff; border: 1px solid #4db8ff; }
     .macd-whale-zayif { background-color: #1a2020; color: #88aabb; border: 1px solid #557788; }
@@ -801,6 +817,8 @@ st.markdown("""
     .macd-dalga-diger { background-color: #1a1a10; color: #999966; border: 1px solid #777755; }
     .stat-card { background-color: #1e2127; padding: 10px; border-radius: 10px; margin-bottom: 10px; border-left: 5px solid #f1c40f; }
     .debug-box { background-color: #1a1a2e; border: 1px solid #333; border-radius: 8px; padding: 10px; font-family: monospace; font-size: 0.75rem; color: #aaa; max-height: 200px; overflow-y: auto; }
+    .watchdog-ok { color: #00ff88; font-size: 0.75rem; }
+    .watchdog-warn { color: #f1c40f; font-size: 0.75rem; }
     table { width: 100%; border-collapse: collapse; }
     th, td { white-space: nowrap; padding: 12px 15px; text-align: left; border-bottom: 1px solid #222; }
     .sym-link { color: #f1c40f; text-decoration: none; font-weight: bold; font-size: 1.1rem; }
@@ -817,23 +835,20 @@ st.markdown("""
 
 radar = get_radar_instance()
 
-# Worker thread — sadece bir kez baslat
-if "thread_started" not in st.session_state:
-    t = threading.Thread(target=binance_worker, args=(radar,), daemon=True)
-    t.start()
-    st.session_state.thread_started = True
-    radar.log(">>> UI: Thread baslatildi (v3.0)")
+# ==================== WATCHDOG: Her refresh'te çalışır ====================
+# Eski kod: if "thread_started" not in st.session_state: ...
+# Yeni kod: thread canlı mı diye her seferinde kontrol et
+watchdog_restarted = radar.ensure_worker_running()
 
-# ==================== NAVIGATION ====================
+# ==================== SIDEBAR ====================
 st.sidebar.title("Navigation")
 page = st.sidebar.radio(
-    "Sayfa Sec",
+    "Sayfa Seç",
     ["Normal Sinyaller", "MACD Pattern Radar", "Sistem Durumu"],
     index=0,
 )
 st.sidebar.markdown("---")
 
-# Sidebar: baglanti durumu
 with st.sidebar:
     elapsed = time.time() - radar.last_heartbeat
     current_url = radar._get_current_url()
@@ -844,16 +859,25 @@ with st.sidebar:
     elif elapsed < 30:
         st.warning(f"YAVAS | {url_short} | {elapsed:.0f}s")
     else:
-        st.error(f"KESINTI | {url_short} | {elapsed:.0f}s")
+        st.error(f"KESİNTİ | {url_short} | {elapsed:.0f}s")
 
-    st.caption(f"URL hata: {radar._url_failures}/2 | Circuit: {'ACIK' if radar._circuit_open else 'KAPALI'}")
+    thread_alive = radar._worker_thread is not None and radar._worker_thread.is_alive()
+    if thread_alive:
+        st.markdown('<span class="watchdog-ok">● Thread canlı</span>', unsafe_allow_html=True)
+    else:
+        st.markdown('<span class="watchdog-warn">⟳ Thread yeniden başlatılıyor...</span>', unsafe_allow_html=True)
+
+    if watchdog_restarted:
+        st.warning("⚡ Watchdog thread'i yeniden başlattı")
+
+    st.caption(f"URL hata: {radar._url_failures}/2 | Circuit: {'AÇIK' if radar._circuit_open else 'KAPALI'}")
     st.caption(f"Fetch interval: {radar._current_fetch_interval}s | Rate hits: {radar._rate_limit_hits}")
-    st.caption("v3.0 BULLETPROOF | Market Radar Pro")
+    st.caption("v4.0 SELF-HEALING | Market Radar Pro")
 
 # ==================== HEADER ====================
 h1, h2, h3, h4 = st.columns([2, 1, 1, 1])
 h1.title("Market Radar Pro")
-h1.caption("v3.0 BULLETPROOF — Baglanti stabil, otomatik kurtarma, circuit breaker")
+h1.caption("v4.0 SELF-HEALING — Watchdog, kesilebilir sleep, bellek yönetimi, executor koruması")
 
 elapsed = time.time() - radar.last_heartbeat
 if elapsed < 15:
@@ -871,11 +895,10 @@ h2.markdown(
 h3.metric("Pairs", radar.total_pairs)
 h3.metric("Signals", len(radar.signals))
 h4.metric("MACD Aday", len(radar.macd_pattern_candidates))
-h4.metric("Hata Sayisi", radar._consecutive_errors)
+h4.metric("Hata Sayısı", radar._consecutive_errors)
 
 st.divider()
 
-# ==================== DEBUG PANEL ====================
 with st.expander("Debug Log", expanded=False):
     with radar.lock:
         logs = list(radar.debug_log)
@@ -883,12 +906,11 @@ with st.expander("Debug Log", expanded=False):
         log_html = "<div class='debug-box'>" + "<br>".join(logs) + "</div>"
         st.markdown(log_html, unsafe_allow_html=True)
     else:
-        st.info("Henuz log yok...")
+        st.info("Henüz log yok...")
 
 st.divider()
 
-
-# ==================== HELPER: MACD CSS ====================
+# ==================== YARDIMCI FONKSİYONLAR ====================
 
 def get_macd_pattern_css_class(pattern):
     if not pattern:
@@ -932,12 +954,10 @@ def get_pattern_score_sort(pattern):
 
 
 # ================================================================
-# SAYFA 1: NORMAL SINYALLER
+# SAYFA 1: NORMAL SİNYALLER
 # ================================================================
 
 if page == "Normal Sinyaller":
-    h1.caption("Flash: Anlik hareket | Confirmed: 3dk+15dk | MACD: WHALE TRAP / FINAL BREAKOUT / TRIPLE CROSS / DALGA")
-
     col_filters = st.columns([1, 1, 1, 1])
     mode_filter = col_filters[0].multiselect(
         "Sinyal Modu",
@@ -946,16 +966,15 @@ if page == "Normal Sinyaller":
         key="mode_filter"
     )
     pd_filter = col_filters[1].multiselect(
-        "Yon",
+        "Yön",
         ["PUMP", "BUY", "DUMP", "SELL"],
         default=["PUMP", "BUY", "DUMP", "SELL"],
         key="pd_filter"
     )
-    search_query = col_filters[2].text_input("Symbol Filter", placeholder="BTC...", key="search").upper()
-    macd_only = col_filters[3].checkbox("Sadece MACD Pattern'li sinyaller", value=False)
+    search_query = col_filters[2].text_input("Symbol Filtre", placeholder="BTC...", key="search").upper()
+    macd_only = col_filters[3].checkbox("Sadece MACD Pattern'li", value=False)
 
     st.divider()
-
     col_side, col_main = st.columns([1, 5])
 
     def get_mode_css_class(mode):
@@ -992,7 +1011,6 @@ if page == "Normal Sinyaller":
 
     with col_main:
         st.subheader("Intelligence Stream")
-
         with radar.lock:
             signals = list(radar.signals)
 
@@ -1048,7 +1066,7 @@ if page == "Normal Sinyaller":
             html += "</table>"
             st.markdown(html, unsafe_allow_html=True)
         else:
-            st.info("Sinyal araniyor... Market taraniyor")
+            st.info("Sinyal aranıyor... Market taranıyor")
 
     time.sleep(2)
     st.rerun()
@@ -1059,17 +1077,15 @@ if page == "Normal Sinyaller":
 # ================================================================
 
 elif page == "MACD Pattern Radar":
-    h1.caption("15 dakikalik grafiklerde 4 MACD pattern tespiti: WHALE TRAP / FINAL BREAKOUT / TRIPLE CROSS / DALGA")
-
     st.markdown("""
     <div style="background-color:#1a1030; border-left:4px solid #8e44ad; padding:12px 16px; border-radius:4px; margin-bottom:16px;">
-        <b style="color:#c39bd3;">MACD Pattern Radar Nasil Calisir?</b><br>
+        <b style="color:#c39bd3;">MACD Pattern Radar Nasıl Çalışır?</b><br>
         <span style="color:#d5dbdb; font-size:0.9rem;">
-        15 dakikalik mum grafiginde 4 farkli MACD pattern'i arar:<br><br>
-        <b style="color:#00d4ff;">WHALE TRAP</b> — Sifir uzerinde, sikisma sonrasi kesisim, ivme artisi<br>
-        <b style="color:#00ff88;">FINAL BREAKOUT</b> — Histogram genisliyor, momentum logaritmik artiyor, fiyat HH<br>
-        <b style="color:#ff6bff;">TRIPLE CROSS</b> — Uc kez yukari kesisim, her biri oncekinden yuksek, ilki sifir altinda<br>
-        <b style="color:#ffcc00;">DALGA</b> — 5 adimli sistem: Sikisma -> Sifir kesimi -> Geri cekilme -> Tekrar kesisim -> AL<br>
+        15 dakikalık mumda 4 farklı MACD pattern'i arar:<br><br>
+        <b style="color:#00d4ff;">WHALE TRAP</b> — Sıfır üzerinde, sıkışma sonrası kesişim<br>
+        <b style="color:#00ff88;">FINAL BREAKOUT</b> — Histogram genişliyor, momentum artıyor<br>
+        <b style="color:#ff6bff;">TRIPLE CROSS</b> — Üç kez yukarı kesişim, her biri öncekinden yüksek<br>
+        <b style="color:#ffcc00;">DALGA</b> — 5 adımlı sistem: Sıkışma → Sıfır → Geri → Tekrar → AL<br>
         </span>
     </div>
     """, unsafe_allow_html=True)
@@ -1083,8 +1099,8 @@ elif page == "MACD Pattern Radar":
         key="pattern_filter"
     )
     min_strength = col_m3.selectbox(
-        "Min Guclendirme",
-        ["Tumu", "Zayif/Erken+", "Guclu+", "EFSANE"],
+        "Min Güçlendirme",
+        ["Tümü", "Zayif/Erken+", "Guclu+", "EFSANE"],
         index=0,
         key="min_strength"
     )
@@ -1099,9 +1115,8 @@ elif page == "MACD Pattern Radar":
         pattern = info.get("Pattern", "")
         if pattern_search and pattern_search not in sym:
             continue
-        if pattern_filter:
-            if not any(pf in pattern for pf in pattern_filter):
-                continue
+        if pattern_filter and not any(pf in pattern for pf in pattern_filter):
+            continue
         if min_strength == "EFSANE" and "EFSANE" not in pattern:
             continue
         if min_strength == "Guclu+" and not any(x in pattern for x in ["EFSANE", "Guclu"]):
@@ -1117,11 +1132,7 @@ elif page == "MACD Pattern Radar":
     )
 
     if sorted_c:
-        html = (
-            "<table><tr>"
-            "<th>Symbol</th><th>Fiyat</th><th>MACD Pattern</th><th>Guncelleme</th>"
-            "</tr>"
-        )
+        html = "<table><tr><th>Symbol</th><th>Fiyat</th><th>MACD Pattern</th><th>Güncelleme</th></tr>"
         for sym, info in sorted_c:
             tv_url = f"https://www.tradingview.com/chart/?symbol=BINANCE:{sym}USDT.P"
             pattern = info.get("Pattern", "")
@@ -1130,65 +1141,76 @@ elif page == "MACD Pattern Radar":
                 f"<tr class='row-macd'>"
                 f"<td><a href='{tv_url}' target='_blank' class='sym-link'>{sym}</a></td>"
                 f"<td>{info['Fiyat']}</td>"
-                f"<td><span class='macd-pattern-tag {pat_cls}' style='font-size:0.95rem;'>"
-                f"{pattern}</span></td>"
+                f"<td><span class='macd-pattern-tag {pat_cls}' style='font-size:0.95rem;'>{pattern}</span></td>"
                 f"<td style='color:#666;'>{info.get('Guncelleme', 'N/A')}</td>"
                 f"</tr>"
             )
         html += "</table>"
         st.markdown(html, unsafe_allow_html=True)
-        st.caption(f"Gosterilen: {len(sorted_c)} | Toplam aday: {len(candidates)}")
+        st.caption(f"Gösterilen: {len(sorted_c)} | Toplam aday: {len(candidates)}")
     else:
-        st.info("MACD pattern taramasi yapiliyor... Semboller analiz ediliyor")
+        st.info("MACD pattern taraması yapılıyor...")
 
     time.sleep(2)
     st.rerun()
 
 
 # ================================================================
-# SAYFA 3: SISTEM DURUMU
+# SAYFA 3: SİSTEM DURUMU
 # ================================================================
 
 elif page == "Sistem Durumu":
-    st.subheader("Sistem Saglik Paneli")
+    st.subheader("Sistem Sağlık Paneli")
 
     col_s1, col_s2, col_s3 = st.columns(3)
 
+    thread_alive = radar._worker_thread is not None and radar._worker_thread.is_alive()
+
     with col_s1:
-        st.metric("Toplam Istek", radar._total_requests)
-        st.metric("Rate Limit Carpma", radar._rate_limit_hits)
+        st.metric("Toplam İstek", radar._total_requests)
+        st.metric("Rate Limit Çarpma", radar._rate_limit_hits)
         st.metric("Ardışık Hata", radar._consecutive_errors)
 
     with col_s2:
         st.metric("Aktif URL", radar._get_current_url().replace("https://", ""))
-        st.metric("URL Hata Sayisi", f"{radar._url_failures}/2")
-        st.metric("Circuit Breaker", "ACIK" if radar._circuit_open else "KAPALI")
+        st.metric("URL Hata Sayısı", f"{radar._url_failures}/2")
+        st.metric("Circuit Breaker", "AÇIK" if radar._circuit_open else "KAPALI")
 
     with col_s3:
         st.metric("Fetch Interval", f"{radar._current_fetch_interval}s")
-        st.metric("Session Yasi", f"{time.time() - radar.session_created_at:.0f}s")
-        st.metric("MACD Executor", f"{MACD_PATTERN_EXECUTOR._max_workers} workers")
+        st.metric("Session Yaşı", f"{time.time() - radar.session_created_at:.0f}s")
+        st.metric("Worker Thread", "✅ CANLI" if thread_alive else "⚠️ BAŞLATIYOR")
 
     st.divider()
-    st.subheader("Baglanti Istikrari")
+    st.subheader("Bağlantı İstikrarı")
 
     elapsed = time.time() - radar.last_heartbeat
     if elapsed < 15:
-        st.success(f"✅ Baglanti saglikli — son heartbeat {elapsed:.1f}s once")
+        st.success(f"✅ Bağlantı sağlıklı — son heartbeat {elapsed:.1f}s önce")
     elif elapsed < 60:
-        st.warning(f"⚠️ Baglanti yavas — son heartbeat {elapsed:.1f}s once")
+        st.warning(f"⚠️ Bağlantı yavaş — son heartbeat {elapsed:.1f}s önce")
     else:
-        st.error(f"❌ Baglanti kesik — son heartbeat {elapsed:.1f}s once. Sistem otomatik kurtarma modunda.")
+        st.error(f"❌ Bağlantı kesik — {elapsed:.1f}s önce. Watchdog müdahale ediyor.")
 
     st.info("""
-    **v3.0 BULLETPROOF Gelistirmeleri:**
-    - **Circuit Breaker**: Ardışık hatalarda otomatik bekleme
-    - **Adaptive Interval**: Hata sayisina gore fetch hizi ayarlanir
-    - **5 URL Rotasyonu**: fapi, fapi1-4 arasi otomatik gecis
-    - **Session Refresh**: Her 10dk'da bir + keep-alive hatasinda aninda
-    - **Rate Limit Monitoring**: X-MBX-USED-WEIGHT header'i takip edilir
-    - **Jitter**: Istekler arasi rastgele gecikme (0.01-0.08s)
-    - **Proactive Throttling**: Weight 1000+ oldugunda yavaslatma
+    **v4.0 SELF-HEALING Değişiklikleri (v3.0'a göre):**
+
+    **🔴 Kök Sorun 1 — Thread ölünce dirilemediyordu:**
+    Eski: `if "thread_started" not in session_state` → sadece bir kez başlatıyordu
+    Yeni: `ensure_worker_running()` her UI refresh'te `.is_alive()` kontrol eder, ölmüşse yeniden başlatır
+
+    **🔴 Kök Sorun 2 — `time.sleep()` thread'i donduruyordu:**
+    Eski: `time.sleep(retry_after)` → circuit breaker içinde 120s donabiliyordu
+    Yeni: `_interruptible_sleep()` → 1s dilimlerinde, `stop_event` / `circuit_event` ile kesilebilir
+
+    **🔴 Kök Sorun 3 — 15m cache büyüyordu (bellek sızıntısı):**
+    Yeni: `_clean_15m_cache()` her 30 fetch'te bir 10 dakikadan eski kayıtları siler
+
+    **🔴 Kök Sorun 4 — MACD executor zombie task biriktiriyordu:**
+    Yeni: Executor instance'a taşındı, `stop_event` kontrolü ile görevler erken çıkıyor
+
+    **🔴 Kök Sorun 5 — Worker exception'da tamamen ölüyordu:**
+    Yeni: `while not stop_event` döngüsünde her exception yakalanıyor, loop kırılmıyor
     """)
 
     time.sleep(3)

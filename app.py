@@ -1900,7 +1900,7 @@ elif page == "OB / OI / Funding":
                         f"<tr class='{row_style}'>"
                         f"<td><a href='{tv_url}' target='_blank' class='sym-link'>{sym_c}</a></td>"
                         f"<td style='color:{r_color}; font-weight:bold;'>{rate:.4f}%</td>"
-                        f"<td>{price_f:.4f if price_f < 1 else price_f:.2f}</td>"
+                        f"<td>{price_f:.4f if price_f < 1 else f'{price_f:.2f}'}</td>"
                         f"</tr>"
                     )
                 html += "</table>"

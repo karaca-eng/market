@@ -13,17 +13,36 @@ import random
 import socket
 
 # ==================== CONFIGURATION ====================
-MIN_VOL_3M = 40000
-MIN_CHG_3M = 1.0
-CONFIRM_CHG_15M = 1.3
-FAST_STRIKE_CHG = 1.0
-TRI_WINDOW = 180
+MIN_VOL_3M = 15000
+MIN_CHG_3M = 0.8
+CONFIRM_CHG_15M = 1.0
+FAST_STRIKE_CHG = 0.8
+TRI_WINDOW = 181
 MAX_DISPLAY_ROWS = 100
 FETCH_INTERVAL = 10
 PUMP_DUMP_THRESHOLD = 2.2
 
+SIGNAL_DEDUP_SECONDS = 60
+
 MACD_PATTERN_COOLDOWN = 180
 _KLINE_SEMAPHORE = threading.Semaphore(2)
+
+# ==================== YENİ: ORDER BOOK / OI / FUNDING AYARLARI ====================
+OB_FETCH_INTERVAL = 15          # saniye — order book polling aralığı
+OB_IMBALANCE_THRESHOLD = 3.0    # bid/ask oranı: 3x büyükse baskı var
+OB_DEPTH_LIMIT = 20             # kaç seviye depth çekilsin
+OB_MIN_BID_SIZE = 100_000       # USDT — küçük coinlerde gürültüyü filtrele
+
+OI_FETCH_INTERVAL = 30          # saniye — OI polling aralığı
+OI_RISE_THRESHOLD = 0.8         # % — OI artış eşiği (düşük tutuldu, erken yakalama)
+OI_FLAT_PRICE_MAX_CHG = 0.3     # % — "fiyat yatay iken" filtresi
+OI_DIVERGE_CHG = 0.5            # % — fiyat yukarı ama OI düşüyorsa sahte pump eşiği
+
+FUNDING_FETCH_INTERVAL = 60     # saniye — funding rate polling aralığı
+FUNDING_SQUEEZE_THRESHOLD = -0.05  # % — bu kadar negatif altı = short ağır, squeeze ortamı
+FUNDING_EXTREME_THRESHOLD = -0.10  # % — aşırı negatif = yüksek öncelikli sinyal
+FUNDING_DEDUP_SECONDS = 300     # funding sinyali ne sıklıkla tekrar basılsın
+# ==================== / ====================
 
 BINANCE_REST_URLS = [
     "https://fapi.binance.com",
@@ -55,7 +74,7 @@ def create_session():
         status_forcelist=[500, 502, 503, 504],
         allowed_methods=["GET"],
         raise_on_status=False,
-        respect_retry_after_header=False,  # Manuel yönetiyoruz
+        respect_retry_after_header=False,
     )
     adapter = HTTPAdapter(
         max_retries=retry_strategy,
@@ -244,6 +263,25 @@ def get_signal_label(direction: str, chg: float) -> str:
     return "BUY" if direction == "up" else "SELL"
 
 
+# ==================== YENİ: ORDER BOOK BASINCI ANALİZİ ====================
+
+def calc_order_book_imbalance(bids, asks):
+    """
+    bids / asks: [[fiyat_str, miktar_str], ...]
+    Döner: (bid_total_usdt, ask_total_usdt, imbalance_ratio, direction)
+    imbalance_ratio > 1 → bid baskısı (alım), < 1 → ask baskısı (satım)
+    """
+    bid_total = sum(float(p) * float(q) for p, q in bids)
+    ask_total = sum(float(p) * float(q) for p, q in asks)
+    if ask_total == 0:
+        return bid_total, ask_total, 99.0, "up"
+    if bid_total == 0:
+        return bid_total, ask_total, 0.0, "down"
+    ratio = bid_total / ask_total
+    direction = "up" if ratio >= 1.0 else "down"
+    return bid_total, ask_total, ratio, direction
+
+
 # ==================== ANA SINIF ====================
 
 class MarketRadar:
@@ -273,21 +311,55 @@ class MarketRadar:
         self.macd_pattern_candidates = {}
         self.macd_pattern_last_trigger = {}
 
-        # Circuit breaker
+        self._signal_last_time = {}
+
+        self.dbg_flash_checked = 0
+        self.dbg_flash_ok = 0
+        self.dbg_flash_blocked_dedup = 0
+        self.dbg_confirmed_checked = 0
+        self.dbg_confirmed_ok = 0
+        self.dbg_confirmed_blocked_vol = 0
+        self.dbg_confirmed_blocked_chg = 0
+        self.dbg_confirmed_blocked_15m = 0
+        self.dbg_confirmed_blocked_dedup = 0
+
         self._circuit_open = False
         self._circuit_open_until = 0
-        self._circuit_event = threading.Event()  # YENİ: sleep interrupt için
+        self._circuit_event = threading.Event()
 
-        # Adaptive fetch interval
         self._current_fetch_interval = FETCH_INTERVAL
         self._healthy_streak = 0
 
-        # YENİ: Thread watchdog
         self._worker_thread = None
         self._stop_event = threading.Event()
 
-        # YENİ: MACD executor (instance'a taşındı, yönetilebilir)
         self._macd_executor = ThreadPoolExecutor(max_workers=3, thread_name_prefix="macd")
+
+        # ==================== YENİ: OB / OI / FUNDING STATE ====================
+
+        # Order Book son baskı tablosu: sembol → {ratio, direction, bid_usdt, ask_usdt, ts}
+        self.ob_state = {}
+        self._ob_last_fetch = {}          # sembol → son fetch zamanı
+        self._ob_semaphore = threading.Semaphore(4)  # eş zamanlı OB isteği limiti
+
+        # Open Interest önbelleği: sembol → {oi, price, ts}
+        self.oi_state = {}
+        self._oi_last_fetch = {}          # sembol → son fetch zamanı
+        self._oi_semaphore = threading.Semaphore(4)
+
+        # Funding Rate önbelleği: sembol → {rate, ts}
+        self.funding_state = {}
+        self._funding_last_fetch = 0      # tüm semboller toplu çekilir
+        self._funding_signal_sent = {}    # sembol → son sinyal zamanı
+
+        # UI'da göstermek için özet tablolar
+        self.ob_pressure_log = deque(maxlen=50)    # son OB sinyal kayıtları
+        self.oi_divergence_log = deque(maxlen=50)  # son OI uyarıları
+        self.funding_log = deque(maxlen=50)        # son funding anomalileri
+
+        # OB/OI/Funding worker thread
+        self._aux_worker_thread = None
+        # ==================== / ====================
 
     def log(self, msg):
         t = datetime.now().strftime("%H:%M:%S")
@@ -299,15 +371,11 @@ class MarketRadar:
     # ==================== THREAD WATCHDOG ====================
 
     def ensure_worker_running(self):
-        """
-        Her UI refresh'te çağrılır.
-        Thread ölmüşse temiz şekilde yeniden başlatır.
-        """
+        restarted = False
         if self._worker_thread is None or not self._worker_thread.is_alive():
             self.log(">>> WATCHDOG: Worker thread yok veya ölü — yeniden başlatılıyor")
             self._stop_event.clear()
             self._circuit_event.clear()
-            # Yeni session aç (eski bağlantılar kirli olabilir)
             self._refresh_session_if_needed(force=True)
             t = threading.Thread(
                 target=self._worker_loop,
@@ -317,13 +385,25 @@ class MarketRadar:
             t.start()
             self._worker_thread = t
             self.log(f">>> WATCHDOG: Thread başlatıldı (id={t.ident})")
-            return True
-        return False
+            restarted = True
+
+        # YENİ: Yardımcı (OB/OI/Funding) thread watchdog
+        if self._aux_worker_thread is None or not self._aux_worker_thread.is_alive():
+            self.log(">>> WATCHDOG: Aux worker (OB/OI/Funding) başlatılıyor")
+            t2 = threading.Thread(
+                target=self._aux_worker_loop,
+                name="AuxWorker",
+                daemon=True,
+            )
+            t2.start()
+            self._aux_worker_thread = t2
+            self.log(f">>> WATCHDOG: Aux thread başlatıldı (id={t2.ident})")
+
+        return restarted
 
     def stop_worker(self):
-        """Graceful shutdown"""
         self._stop_event.set()
-        self._circuit_event.set()  # Uyuyan thread'i uyandır
+        self._circuit_event.set()
 
     # ==================== URL YÖNETİMİ ====================
 
@@ -389,20 +469,15 @@ class MarketRadar:
     def _open_circuit(self, duration=60):
         self._circuit_open = True
         self._circuit_open_until = time.time() + duration
-        self._circuit_event.set()  # _interruptible_sleep'i uyandır
+        self._circuit_event.set()
         self.log(f"Circuit breaker AÇILDI — {duration}s bekleniyor")
 
     def _interruptible_sleep(self, seconds):
-        """
-        time.sleep() yerine kullan — stop_event veya circuit_event ile
-        kesilebilir. Thread donmaz.
-        """
         deadline = time.time() + seconds
         while time.time() < deadline:
             if self._stop_event.is_set():
                 return
             remaining = deadline - time.time()
-            # max 1 saniyelik dilimler halinde uyu
             self._circuit_event.wait(timeout=min(1.0, remaining))
             self._circuit_event.clear()
 
@@ -442,7 +517,6 @@ class MarketRadar:
 
             if response.status_code == 200:
                 self._mark_url_success()
-                # Weight header kontrolü
                 for header_name, val in response.headers.items():
                     if 'X-MBX-USED-WEIGHT' in header_name.upper():
                         try:
@@ -517,7 +591,6 @@ class MarketRadar:
     # ==================== 15M CACHE TEMİZLİĞİ ====================
 
     def _clean_15m_cache(self):
-        """Eski cache kayıtlarını sil — bellek sızıntısını önler"""
         now = time.time()
         expired = [k for k, (t, _) in self.price_cache_15m.items() if now - t > 600]
         for k in expired:
@@ -554,21 +627,33 @@ class MarketRadar:
         vol_3m = current[2] - past_3m[2]
         vol_1m = current[2] - past_1m[2]
 
+        self.dbg_flash_checked += 1
         if abs(c1) >= FAST_STRIKE_CHG and vol_1m >= 50000:
             direction = "up" if c1 > 0 else "down"
             label = get_signal_label(direction, c1)
             self.add_signal(symbol, current[1], c1, 0, vol_1m, label, "FLASH", score=40)
-            return
+            self.dbg_flash_ok += 1
 
-        if vol_3m >= MIN_VOL_3M and abs(c3) >= MIN_CHG_3M:
+        self.dbg_confirmed_checked += 1
+        vol_check = max(abs(vol_3m), abs(vol_1m))
+        if vol_check < MIN_VOL_3M:
+            self.dbg_confirmed_blocked_vol += 1
+        elif abs(c3) < MIN_CHG_3M:
+            self.dbg_confirmed_blocked_chg += 1
+        else:
             price_15m_ago = self.get_15m_price(symbol)
-            if price_15m_ago:
+            if not price_15m_ago:
+                self.dbg_confirmed_blocked_15m += 1
+            else:
                 c15 = ((current[1] - price_15m_ago) / price_15m_ago) * 100
                 is_consistent = (c3 > 0 and c15 > 0) or (c3 < 0 and c15 < 0)
                 if is_consistent and abs(c15) >= CONFIRM_CHG_15M:
                     direction = "up" if c3 > 0 else "down"
                     label = get_signal_label(direction, c3)
                     self.add_signal(symbol, current[1], c3, c15, vol_3m, label, "CONFIRMED", score=55)
+                    self.dbg_confirmed_ok += 1
+                else:
+                    self.dbg_confirmed_blocked_chg += 1
 
     def get_15m_price(self, symbol):
         now = time.time()
@@ -587,15 +672,23 @@ class MarketRadar:
             self.log(f"15m price hata ({symbol}): {e}")
         return None
 
-    def add_signal(self, symbol, price, chg_main, chg_ref, vol, s_type, mode, score=50, macd_pattern=None):
+    def add_signal(self, symbol, price, chg_main, chg_ref, vol, s_type, mode, score=50, macd_pattern=None, extra_tag=""):
         t_str = datetime.now().strftime("%H:%M:%S")
         sym_clean = symbol.replace("USDT", "")
         is_up = s_type in ("PUMP", "BUY")
         stat_key = "PUMP" if is_up else "DUMP"
         with self.lock:
-            for s in self.signals[:10]:
-                if s.get('Symbol') == sym_clean and s.get('Mode') == mode:
-                    return
+            dedup_key = f"{sym_clean}|{mode}"
+            now_t = time.time()
+            last_sig_t = self._signal_last_time.get(dedup_key, 0)
+            if now_t - last_sig_t < SIGNAL_DEDUP_SECONDS:
+                if mode == "FLASH":
+                    self.dbg_flash_blocked_dedup += 1
+                else:
+                    self.dbg_confirmed_blocked_dedup += 1
+                return
+            self._signal_last_time[dedup_key] = now_t
+
             if sym_clean not in self.stats_hourly:
                 self.stats_hourly[sym_clean] = {"PUMP": 0, "DUMP": 0}
             self.stats_hourly[sym_clean][stat_key] += 1
@@ -615,14 +708,15 @@ class MarketRadar:
                 "SnapP": self.stats_4h[sym_clean]["PUMP"],
                 "SnapD": self.stats_4h[sym_clean]["DUMP"],
                 "MACD_Pattern": macd_pattern or "",
+                "ExtraTag": extra_tag,          # YENİ: OB/OI/Funding etiketi
             })
             self.log(f"SİNYAL: {sym_clean} {s_type} {mode} {chg_main:+.2f}%" +
-                     (f" | {macd_pattern}" if macd_pattern else ""))
+                     (f" | {macd_pattern}" if macd_pattern else "") +
+                     (f" | {extra_tag}" if extra_tag else ""))
             if len(self.signals) > MAX_DISPLAY_ROWS:
                 self.signals.pop()
 
             if mode in ("FLASH", "CONFIRMED"):
-                now_t = time.time()
                 last_t = self.macd_pattern_last_trigger.get(symbol, 0)
                 if now_t - last_t >= MACD_PATTERN_COOLDOWN:
                     self.macd_pattern_last_trigger[symbol] = now_t
@@ -710,15 +804,434 @@ class MarketRadar:
             else:
                 self.macd_pattern_candidates.pop(sym_clean, None)
 
+    # ================================================================
+    # YENİ: ORDER BOOK BASINCI
+    # ================================================================
+
+    def _fetch_order_book(self, symbol):
+        """
+        /fapi/v1/depth endpoint'inden bid/ask verisini çeker.
+        Döner: (bid_usdt, ask_usdt, ratio, direction) | None
+        """
+        with self._ob_semaphore:
+            url = (
+                f"{self._get_current_url()}/fapi/v1/depth"
+                f"?symbol={symbol}&limit={OB_DEPTH_LIMIT}"
+            )
+            try:
+                resp = self._safe_request(url, timeout=6)
+                if not resp or resp.status_code != 200:
+                    return None
+                data = resp.json()
+                bids = data.get("bids", [])
+                asks = data.get("asks", [])
+                if not bids or not asks:
+                    return None
+                bid_usdt, ask_usdt, ratio, direction = calc_order_book_imbalance(bids, asks)
+                return bid_usdt, ask_usdt, ratio, direction
+            except Exception as e:
+                self.log(f"OB fetch hatası ({symbol}): {str(e)[:60]}")
+                return None
+
+    def _process_order_book(self, symbol, price):
+        """
+        Tek sembol için OB çek, analiz et, gerekirse sinyal üret.
+        Aux worker'dan çağrılır.
+        """
+        now = time.time()
+        last = self._ob_last_fetch.get(symbol, 0)
+        if now - last < OB_FETCH_INTERVAL:
+            return
+        self._ob_last_fetch[symbol] = now
+
+        result = self._fetch_order_book(symbol)
+        if result is None:
+            return
+        bid_usdt, ask_usdt, ratio, direction = result
+
+        sym_clean = symbol.replace("USDT", "")
+        t_str = datetime.now().strftime("%H:%M:%S")
+
+        with self.lock:
+            self.ob_state[sym_clean] = {
+                "ratio": ratio,
+                "direction": direction,
+                "bid_usdt": bid_usdt,
+                "ask_usdt": ask_usdt,
+                "ts": t_str,
+            }
+
+        # Sinyal koşulları
+        # 1) Aşırı imbalance: bid/ask ≥ OB_IMBALANCE_THRESHOLD ve henüz fiyat hareket etmemiş
+        #    (henüz hareket etmemiş = mevcut 1m chg küçük → bu sinyal ÖNCÜ)
+        # 2) Ask tarafı baskısı da aynı mantıkla ters yönde
+
+        if bid_usdt < OB_MIN_BID_SIZE and ask_usdt < OB_MIN_BID_SIZE:
+            return  # Düşük likidite, gürültü
+
+        dedup_key = f"{sym_clean}|OB_PRESSURE"
+        now_t = time.time()
+        with self.lock:
+            last_sig = self._signal_last_time.get(dedup_key, 0)
+            if now_t - last_sig < SIGNAL_DEDUP_SECONDS:
+                return
+
+        if ratio >= OB_IMBALANCE_THRESHOLD:
+            # Güçlü bid baskısı
+            tag = f"📗 OB BİD BASKISI {ratio:.1f}x ({bid_usdt/1000:.0f}k vs {ask_usdt/1000:.0f}k)"
+            self._signal_last_time[dedup_key] = now_t
+            with self.lock:
+                self.ob_pressure_log.appendleft({
+                    "Time": t_str, "Symbol": sym_clean, "Price": f"{price:.4f}" if price < 1 else f"{price:.2f}",
+                    "Tag": tag, "Ratio": f"{ratio:.2f}x", "Direction": "BID",
+                })
+            self.add_signal(
+                symbol=symbol, price=price,
+                chg_main=0.0, chg_ref=0.0, vol=int(bid_usdt),
+                s_type="BUY", mode="OB PRESSURE",
+                score=65, extra_tag=tag,
+            )
+            self.log(f"OB PRESSURE (BID): {sym_clean} ratio={ratio:.2f}x")
+
+        elif ratio <= (1.0 / OB_IMBALANCE_THRESHOLD):
+            # Güçlü ask baskısı
+            tag = f"📕 OB ASK BASKISI {1/ratio:.1f}x ({ask_usdt/1000:.0f}k vs {bid_usdt/1000:.0f}k)"
+            self._signal_last_time[dedup_key] = now_t
+            with self.lock:
+                self.ob_pressure_log.appendleft({
+                    "Time": t_str, "Symbol": sym_clean, "Price": f"{price:.4f}" if price < 1 else f"{price:.2f}",
+                    "Tag": tag, "Ratio": f"{1/ratio:.2f}x", "Direction": "ASK",
+                })
+            self.add_signal(
+                symbol=symbol, price=price,
+                chg_main=0.0, chg_ref=0.0, vol=int(ask_usdt),
+                s_type="SELL", mode="OB PRESSURE",
+                score=65, extra_tag=tag,
+            )
+            self.log(f"OB PRESSURE (ASK): {sym_clean} ratio={1/ratio:.2f}x")
+
+    # ================================================================
+    # YENİ: OPEN INTEREST ANALİZİ
+    # ================================================================
+
+    def _fetch_open_interest(self, symbol):
+        """
+        /fapi/v1/openInterest endpoint'inden anlık OI çeker.
+        Döner: float (USDT cinsinden OI) | None
+        """
+        with self._oi_semaphore:
+            url = f"{self._get_current_url()}/fapi/v1/openInterest?symbol={symbol}"
+            try:
+                resp = self._safe_request(url, timeout=6)
+                if not resp or resp.status_code != 200:
+                    return None
+                data = resp.json()
+                return float(data.get("openInterest", 0))
+            except Exception as e:
+                self.log(f"OI fetch hatası ({symbol}): {str(e)[:60]}")
+                return None
+
+    def _process_open_interest(self, symbol, price):
+        """
+        OI değişimi analizi:
+        - Fiyat yatay + OI artıyor → sessiz birikim (ÖNCÜ)
+        - Fiyat yukarı + OI düşüyor → short kapanışı, sahte pump uyarısı
+        - Fiyat + OI birlikte artıyor → güçlü trend teyidi
+        """
+        now = time.time()
+        last = self._oi_last_fetch.get(symbol, 0)
+        if now - last < OI_FETCH_INTERVAL:
+            return
+        self._oi_last_fetch[symbol] = now
+
+        oi_current = self._fetch_open_interest(symbol)
+        if oi_current is None or oi_current == 0:
+            return
+
+        sym_clean = symbol.replace("USDT", "")
+        t_str = datetime.now().strftime("%H:%M:%S")
+
+        with self.lock:
+            prev = self.oi_state.get(sym_clean)
+
+        if prev is None:
+            with self.lock:
+                self.oi_state[sym_clean] = {"oi": oi_current, "price": price, "ts": now}
+            return
+
+        prev_oi = prev["oi"]
+        prev_price = prev["price"]
+        if prev_oi == 0:
+            return
+
+        oi_chg_pct = ((oi_current - prev_oi) / prev_oi) * 100
+        price_chg_pct = ((price - prev_price) / prev_price) * 100 if prev_price > 0 else 0
+
+        with self.lock:
+            self.oi_state[sym_clean] = {"oi": oi_current, "price": price, "ts": now}
+
+        dedup_key_acc = f"{sym_clean}|OI_ACCUM"
+        dedup_key_fake = f"{sym_clean}|OI_FAKE"
+        dedup_key_trend = f"{sym_clean}|OI_TREND"
+        now_t = time.time()
+
+        # Senaryo 1: Sessiz birikim — fiyat yatay, OI artıyor
+        if (abs(price_chg_pct) <= OI_FLAT_PRICE_MAX_CHG
+                and oi_chg_pct >= OI_RISE_THRESHOLD):
+            last_sig = self._signal_last_time.get(dedup_key_acc, 0)
+            if now_t - last_sig >= SIGNAL_DEDUP_SECONDS:
+                tag = f"🔵 OI BİRİKİM: OI +{oi_chg_pct:.2f}% | Fiyat düz ({price_chg_pct:+.2f}%)"
+                self._signal_last_time[dedup_key_acc] = now_t
+                with self.lock:
+                    self.oi_divergence_log.appendleft({
+                        "Time": t_str, "Symbol": sym_clean,
+                        "Price": f"{price:.4f}" if price < 1 else f"{price:.2f}",
+                        "OI_Chg": f"+{oi_chg_pct:.2f}%",
+                        "Price_Chg": f"{price_chg_pct:+.2f}%",
+                        "Senaryo": "Sessiz Birikim",
+                    })
+                self.add_signal(
+                    symbol=symbol, price=price,
+                    chg_main=oi_chg_pct, chg_ref=price_chg_pct, vol=0,
+                    s_type="BUY", mode="OI SIGNAL",
+                    score=70, extra_tag=tag,
+                )
+                self.log(f"OI BİRİKİM: {sym_clean} OI={oi_chg_pct:+.2f}% fiyat={price_chg_pct:+.2f}%")
+
+        # Senaryo 2: Sahte pump — fiyat yukarı, OI düşüyor (short kapanışı)
+        elif (price_chg_pct >= OI_DIVERGE_CHG
+              and oi_chg_pct <= -OI_RISE_THRESHOLD):
+            last_sig = self._signal_last_time.get(dedup_key_fake, 0)
+            if now_t - last_sig >= SIGNAL_DEDUP_SECONDS:
+                tag = f"⚠️ OI SAHTE PUMP: Fiyat {price_chg_pct:+.2f}% | OI {oi_chg_pct:.2f}% (short kpn)"
+                self._signal_last_time[dedup_key_fake] = now_t
+                with self.lock:
+                    self.oi_divergence_log.appendleft({
+                        "Time": t_str, "Symbol": sym_clean,
+                        "Price": f"{price:.4f}" if price < 1 else f"{price:.2f}",
+                        "OI_Chg": f"{oi_chg_pct:.2f}%",
+                        "Price_Chg": f"{price_chg_pct:+.2f}%",
+                        "Senaryo": "Sahte Pump (short kapanışı)",
+                    })
+                self.add_signal(
+                    symbol=symbol, price=price,
+                    chg_main=price_chg_pct, chg_ref=oi_chg_pct, vol=0,
+                    s_type="SELL", mode="OI SIGNAL",
+                    score=60, extra_tag=tag,
+                )
+                self.log(f"OI SAHTE PUMP: {sym_clean} fiyat={price_chg_pct:+.2f}% OI={oi_chg_pct:.2f}%")
+
+        # Senaryo 3: Güçlü trend teyidi — fiyat + OI birlikte artıyor
+        elif (price_chg_pct >= OI_DIVERGE_CHG
+              and oi_chg_pct >= OI_RISE_THRESHOLD):
+            last_sig = self._signal_last_time.get(dedup_key_trend, 0)
+            if now_t - last_sig >= SIGNAL_DEDUP_SECONDS:
+                tag = f"✅ OI TREND TEYİDİ: Fiyat {price_chg_pct:+.2f}% + OI +{oi_chg_pct:.2f}%"
+                self._signal_last_time[dedup_key_trend] = now_t
+                with self.lock:
+                    self.oi_divergence_log.appendleft({
+                        "Time": t_str, "Symbol": sym_clean,
+                        "Price": f"{price:.4f}" if price < 1 else f"{price:.2f}",
+                        "OI_Chg": f"+{oi_chg_pct:.2f}%",
+                        "Price_Chg": f"{price_chg_pct:+.2f}%",
+                        "Senaryo": "Güçlü Trend Teyidi",
+                    })
+                self.add_signal(
+                    symbol=symbol, price=price,
+                    chg_main=price_chg_pct, chg_ref=oi_chg_pct, vol=0,
+                    s_type="BUY", mode="OI SIGNAL",
+                    score=75, extra_tag=tag,
+                )
+                self.log(f"OI TREND: {sym_clean} fiyat={price_chg_pct:+.2f}% OI={oi_chg_pct:+.2f}%")
+
+    # ================================================================
+    # YENİ: FUNDING RATE ANOMALİSİ
+    # ================================================================
+
+    def _fetch_all_funding_rates(self):
+        """
+        /fapi/v1/premiumIndex — tüm semboller için funding rate döner.
+        Her sembol için lastFundingRate alanı kullanılır.
+        Ağır endpoint değil (1 istek, tüm market).
+        """
+        url = f"{self._get_current_url()}/fapi/v1/premiumIndex"
+        try:
+            resp = self._safe_request(url, timeout=10)
+            if not resp or resp.status_code != 200:
+                return None
+            data = resp.json()
+            result = {}
+            for item in data:
+                sym = item.get("symbol", "")
+                if not sym.endswith("USDT"):
+                    continue
+                try:
+                    rate = float(item.get("lastFundingRate", 0)) * 100  # % cinsinden
+                    mark_price = float(item.get("markPrice", 0))
+                    result[sym] = {"rate": rate, "price": mark_price}
+                except (ValueError, TypeError):
+                    continue
+            return result
+        except Exception as e:
+            self.log(f"Funding fetch hatası: {str(e)[:80]}")
+            return None
+
+    def _process_funding_rates(self):
+        """
+        Tüm semboller için funding rate anomalisi tara.
+        - Aşırı negatif funding: short'lar çok ağır → squeeze ortamı → BUY sinyali
+        - Aşırı pozitif funding: long'lar çok ağır → long squeeze riski → SELL uyarısı (isteğe bağlı, şimdilik sadece loglanır)
+        """
+        now = time.time()
+        if now - self._funding_last_fetch < FUNDING_FETCH_INTERVAL:
+            return
+        self._funding_last_fetch = now
+
+        rates = self._fetch_all_funding_rates()
+        if not rates:
+            return
+
+        t_str = datetime.now().strftime("%H:%M:%S")
+
+        with self.lock:
+            # Tüm state'i güncelle
+            for sym, info in rates.items():
+                sym_clean = sym.replace("USDT", "")
+                self.funding_state[sym_clean] = {
+                    "rate": info["rate"],
+                    "price": info["price"],
+                    "ts": t_str,
+                }
+
+        # Anormalileri tara
+        for sym, info in rates.items():
+            if self._stop_event.is_set():
+                break
+            rate = info["rate"]
+            price = info["price"]
+            sym_clean = sym.replace("USDT", "")
+
+            # Sadece aşırı negatif funding → short squeeze potansiyeli
+            if rate > FUNDING_SQUEEZE_THRESHOLD:  # negatif değil, pas
+                continue
+
+            now_t = time.time()
+            last_sig = self._funding_signal_sent.get(sym_clean, 0)
+            if now_t - last_sig < FUNDING_DEDUP_SECONDS:
+                continue
+
+            # Öncelik belirle
+            is_extreme = rate <= FUNDING_EXTREME_THRESHOLD
+            score = 80 if is_extreme else 65
+            strength_label = "⚡ AŞIRI NEGATİF" if is_extreme else "🔻 Negatif"
+            tag = f"💰 FUNDING {strength_label}: {rate:.4f}% → Short Squeeze Ortamı"
+
+            self._funding_signal_sent[sym_clean] = now_t
+
+            with self.lock:
+                self.funding_log.appendleft({
+                    "Time": t_str,
+                    "Symbol": sym_clean,
+                    "Price": f"{price:.4f}" if price < 1 else f"{price:.2f}",
+                    "Rate": f"{rate:.4f}%",
+                    "Durum": "Squeeze Ortamı" if not is_extreme else "AŞIRI — Yüksek Öncelik",
+                })
+
+            self.add_signal(
+                symbol=sym, price=price,
+                chg_main=rate, chg_ref=0.0, vol=0,
+                s_type="BUY", mode="FUNDING",
+                score=score, extra_tag=tag,
+            )
+            self.log(f"FUNDING ANOMALİ: {sym_clean} rate={rate:.4f}% {'EXTREME' if is_extreme else ''}")
+
+    # ================================================================
+    # YENİ: YARDIMCI WORKER LOOP (OB / OI / FUNDING)
+    # ================================================================
+
+    def _aux_worker_loop(self):
+        """
+        Ana ticker loop'undan bağımsız, düşük frekanslı:
+        - Order Book: aktif semboller üzerinde polling
+        - Open Interest: aktif semboller üzerinde polling
+        - Funding Rate: tüm market, toplu
+        """
+        self.log(">>> AUX WORKER LOOP BAŞLADI (OB/OI/Funding)")
+
+        ob_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="ob_oi")
+        cycle = 0
+
+        while not self._stop_event.is_set():
+            try:
+                cycle += 1
+
+                # ---- Aktif sembol listesi (history'den al, son 60s veri olanlar) ----
+                now = time.time()
+                with self.lock:
+                    active_symbols = [
+                        sym for sym, hist in self.history.items()
+                        if hist and (now - hist[-1][0]) < 60
+                    ]
+
+                if not active_symbols:
+                    self._interruptible_sleep(5)
+                    continue
+
+                # ---- Funding Rate (toplu, FUNDING_FETCH_INTERVAL'da bir) ----
+                self._process_funding_rates()
+
+                # ---- OB + OI (her sembol için, kendi interval'larına göre) ----
+                # Sembol başına çok istek atmamak için rastgele shuffle + limit
+                shuffled = list(active_symbols)
+                random.shuffle(shuffled)
+                selected = shuffled[:30]  # Her cycle en fazla 30 sembol işle
+
+                futures = []
+                for sym in selected:
+                    if self._stop_event.is_set():
+                        break
+                    with self.lock:
+                        hist = self.history.get(sym)
+                        price = float(hist[-1][1]) if hist else 0.0
+
+                    if price <= 0:
+                        continue
+
+                    # OB ve OI görevlerini paralel gönder
+                    f1 = ob_executor.submit(self._process_order_book, sym, price)
+                    f2 = ob_executor.submit(self._process_open_interest, sym, price)
+                    futures.extend([f1, f2])
+
+                # Tüm görevlerin bitmesini bekle (timeout ile)
+                for f in futures:
+                    try:
+                        f.result(timeout=10)
+                    except Exception as e:
+                        self.log(f"Aux task hatası: {str(e)[:60]}")
+
+                if cycle % 10 == 0:
+                    with self.lock:
+                        ob_count = len(self.ob_state)
+                        oi_count = len(self.oi_state)
+                        fund_count = len(self.funding_state)
+                    self.log(
+                        f"AUX cycle #{cycle} | OB:{ob_count} OI:{oi_count} "
+                        f"Funding:{fund_count} | Active:{len(active_symbols)}"
+                    )
+
+                self._interruptible_sleep(5)  # Aux loop 5s'de bir döner
+
+            except Exception as e:
+                wait = 10
+                self.log(f"AUX WORKER İSTİSNA: {str(e)[:120]} — {wait}s bekle")
+                self._interruptible_sleep(wait)
+
+        self.log(">>> AUX WORKER LOOP DURDU")
+
     # ==================== WORKER LOOP ====================
 
     def _worker_loop(self):
-        """
-        Tek sorumluluk: Binance'ten veri çek, işle, uy.
-        Exception ne olursa olsun döngü kırılmaz.
-        Thread watchdog bu methodu çağırır.
-        """
-        self.log(">>> WORKER LOOP BAŞLADI (v4.0)")
+        self.log(">>> WORKER LOOP BAŞLADI (v4.1)")
         self.get_working_rest_url()
 
         fetch_count = 0
@@ -726,7 +1239,6 @@ class MarketRadar:
 
         while not self._stop_event.is_set():
             try:
-                # Circuit breaker aktifse interrupt edilebilir şekilde bekle
                 if self._circuit_open:
                     remaining = max(1, int(self._circuit_open_until - time.time()))
                     self.log(f"Circuit açık — {remaining}s bekleniyor (kesilebilir)")
@@ -748,7 +1260,6 @@ class MarketRadar:
                     ]
                     self.process_ticker(formatted)
 
-                    # Periyodik görevler
                     if fetch_count % 200 == 0:
                         self._refresh_session_if_needed(force=True)
                     if cache_clean_counter >= 30:
@@ -759,19 +1270,19 @@ class MarketRadar:
                             f"Fetch #{fetch_count} | {current_url.replace('https://', '')} | "
                             f"Pairs:{self.total_pairs} Signals:{len(self.signals)} "
                             f"MACD:{len(self.macd_pattern_candidates)} "
+                            f"OB:{len(self.ob_state)} OI:{len(self.oi_state)} "
+                            f"Funding:{len(self.funding_state)} "
                             f"Interval:{self._current_fetch_interval}s"
                         )
 
                     self._interruptible_sleep(self._current_fetch_interval)
 
                 else:
-                    # Başarısız fetch — kısa exponential backoff
                     wait = min(3 * (self._consecutive_errors + 1), 45)
                     self.log(f"Fetch başarısız — {wait}s bekleniyor")
                     self._interruptible_sleep(wait)
 
             except Exception as e:
-                # Hiçbir şey thread'i öldüremez
                 wait = min(5 * (self._consecutive_errors + 1), 60)
                 self.log(f"WORKER İSTİSNA (döngü devam): {str(e)[:120]} — {wait}s bekle")
                 self._interruptible_sleep(wait)
@@ -788,7 +1299,7 @@ def get_radar_instance():
 
 # ==================== STREAMLIT UI ====================
 
-st.set_page_config(layout="wide", page_title="Market Radar Pro v4.0")
+st.set_page_config(layout="wide", page_title="Market Radar Pro v4.1")
 
 st.markdown("""
     <style>
@@ -803,6 +1314,9 @@ st.markdown("""
     .mode-confirmed { background-color: #1abc9c; color: #fff; padding: 2px 8px; border-radius: 4px; font-weight: bold; }
     .mode-flash { background-color: #e67e22; color: #fff; padding: 2px 8px; border-radius: 4px; font-weight: bold; }
     .mode-macd  { background-color: #8e44ad; color: #fff; padding: 2px 8px; border-radius: 4px; font-weight: bold; }
+    .mode-ob    { background-color: #1a5276; color: #aed6f1; padding: 2px 8px; border-radius: 4px; font-weight: bold; }
+    .mode-oi    { background-color: #1e8449; color: #abebc6; padding: 2px 8px; border-radius: 4px; font-weight: bold; }
+    .mode-funding { background-color: #7d6608; color: #f9e79f; padding: 2px 8px; border-radius: 4px; font-weight: bold; }
     .macd-pattern-tag { padding: 2px 8px; border-radius: 4px; font-size: 0.78rem; font-weight: bold; display: inline-block; white-space: nowrap; }
     .macd-whale-efsane { background-color: #1a3a4a; color: #00d4ff; border: 1px solid #00d4ff; }
     .macd-whale-guclu { background-color: #1a2a3a; color: #4db8ff; border: 1px solid #4db8ff; }
@@ -819,6 +1333,7 @@ st.markdown("""
     .debug-box { background-color: #1a1a2e; border: 1px solid #333; border-radius: 8px; padding: 10px; font-family: monospace; font-size: 0.75rem; color: #aaa; max-height: 200px; overflow-y: auto; }
     .watchdog-ok { color: #00ff88; font-size: 0.75rem; }
     .watchdog-warn { color: #f1c40f; font-size: 0.75rem; }
+    .extra-tag-cell { font-size: 0.78rem; color: #bbb; max-width: 280px; white-space: normal; word-break: break-word; }
     table { width: 100%; border-collapse: collapse; }
     th, td { white-space: nowrap; padding: 12px 15px; text-align: left; border-bottom: 1px solid #222; }
     .sym-link { color: #f1c40f; text-decoration: none; font-weight: bold; font-size: 1.1rem; }
@@ -830,21 +1345,21 @@ st.markdown("""
     .row-conf-pump  { background-color: rgba(0, 255, 136, 0.08) !important; }
     .row-conf-dump  { background-color: rgba(255, 75,  75,  0.08) !important; }
     .row-macd       { background-color: rgba(142, 68, 173, 0.12) !important; border-left: 3px solid #8e44ad !important; }
+    .row-ob         { background-color: rgba(26, 82, 118, 0.18) !important; border-left: 3px solid #2980b9 !important; }
+    .row-oi         { background-color: rgba(30, 132, 73, 0.15) !important; border-left: 3px solid #27ae60 !important; }
+    .row-funding    { background-color: rgba(125, 102, 8, 0.20) !important; border-left: 3px solid #f1c40f !important; }
     </style>
 """, unsafe_allow_html=True)
 
 radar = get_radar_instance()
 
-# ==================== WATCHDOG: Her refresh'te çalışır ====================
-# Eski kod: if "thread_started" not in st.session_state: ...
-# Yeni kod: thread canlı mı diye her seferinde kontrol et
 watchdog_restarted = radar.ensure_worker_running()
 
 # ==================== SIDEBAR ====================
 st.sidebar.title("Navigation")
 page = st.sidebar.radio(
     "Sayfa Seç",
-    ["Normal Sinyaller", "MACD Pattern Radar", "Sistem Durumu"],
+    ["Normal Sinyaller", "MACD Pattern Radar", "OB / OI / Funding", "Sistem Durumu"],
     index=0,
 )
 st.sidebar.markdown("---")
@@ -862,22 +1377,27 @@ with st.sidebar:
         st.error(f"KESİNTİ | {url_short} | {elapsed:.0f}s")
 
     thread_alive = radar._worker_thread is not None and radar._worker_thread.is_alive()
+    aux_alive = radar._aux_worker_thread is not None and radar._aux_worker_thread.is_alive()
     if thread_alive:
-        st.markdown('<span class="watchdog-ok">● Thread canlı</span>', unsafe_allow_html=True)
+        st.markdown('<span class="watchdog-ok">● Main thread canlı</span>', unsafe_allow_html=True)
     else:
-        st.markdown('<span class="watchdog-warn">⟳ Thread yeniden başlatılıyor...</span>', unsafe_allow_html=True)
+        st.markdown('<span class="watchdog-warn">⟳ Main thread yeniden başlatılıyor...</span>', unsafe_allow_html=True)
+    if aux_alive:
+        st.markdown('<span class="watchdog-ok">● Aux thread (OB/OI/F) canlı</span>', unsafe_allow_html=True)
+    else:
+        st.markdown('<span class="watchdog-warn">⟳ Aux thread yeniden başlatılıyor...</span>', unsafe_allow_html=True)
 
     if watchdog_restarted:
         st.warning("⚡ Watchdog thread'i yeniden başlattı")
 
     st.caption(f"URL hata: {radar._url_failures}/2 | Circuit: {'AÇIK' if radar._circuit_open else 'KAPALI'}")
     st.caption(f"Fetch interval: {radar._current_fetch_interval}s | Rate hits: {radar._rate_limit_hits}")
-    st.caption("v4.0 SELF-HEALING | Market Radar Pro")
+    st.caption("v4.1 OB/OI/FUNDING | Market Radar Pro")
 
 # ==================== HEADER ====================
-h1, h2, h3, h4 = st.columns([2, 1, 1, 1])
+h1, h2, h3, h4, h5 = st.columns([2, 1, 1, 1, 1])
 h1.title("Market Radar Pro")
-h1.caption("v4.0 SELF-HEALING — Watchdog, kesilebilir sleep, bellek yönetimi, executor koruması")
+h1.caption("v4.1 — Order Book Basıncı, Open Interest Divergence, Funding Rate Anomalisi")
 
 elapsed = time.time() - radar.last_heartbeat
 if elapsed < 15:
@@ -895,7 +1415,9 @@ h2.markdown(
 h3.metric("Pairs", radar.total_pairs)
 h3.metric("Signals", len(radar.signals))
 h4.metric("MACD Aday", len(radar.macd_pattern_candidates))
-h4.metric("Hata Sayısı", radar._consecutive_errors)
+h4.metric("OB İzlenen", len(radar.ob_state))
+h5.metric("OI İzlenen", len(radar.oi_state))
+h5.metric("Funding", len(radar.funding_state))
 
 st.divider()
 
@@ -953,16 +1475,42 @@ def get_pattern_score_sort(pattern):
     return score
 
 
+def get_mode_css_class(mode):
+    if "CONFIRMED" in mode: return "mode-confirmed"
+    if "MACD" in mode: return "mode-macd"
+    if "OB PRESSURE" in mode: return "mode-ob"
+    if "OI SIGNAL" in mode: return "mode-oi"
+    if "FUNDING" in mode: return "mode-funding"
+    return "mode-flash"
+
+
+def label_css(s_type):
+    return {
+        "PUMP": "pump-label", "DUMP": "dump-label",
+        "BUY": "buy-label", "SELL": "sell-label"
+    }.get(s_type, "buy-label")
+
+
+def row_css(s_type, mode):
+    if "MACD" in mode: return "row-macd"
+    if "OB PRESSURE" in mode: return "row-ob"
+    if "OI SIGNAL" in mode: return "row-oi"
+    if "FUNDING" in mode: return "row-funding"
+    is_up = s_type in ("PUMP", "BUY")
+    if "FLASH" in mode: return "row-flash-pump" if is_up else "row-flash-dump"
+    return "row-conf-pump" if is_up else "row-conf-dump"
+
+
 # ================================================================
 # SAYFA 1: NORMAL SİNYALLER
 # ================================================================
 
 if page == "Normal Sinyaller":
-    col_filters = st.columns([1, 1, 1, 1])
+    col_filters = st.columns([1, 1, 1, 1, 1])
     mode_filter = col_filters[0].multiselect(
         "Sinyal Modu",
-        ["FLASH", "CONFIRMED", "MACD PATTERN"],
-        default=["FLASH", "CONFIRMED", "MACD PATTERN"],
+        ["FLASH", "CONFIRMED", "MACD PATTERN", "OB PRESSURE", "OI SIGNAL", "FUNDING"],
+        default=["FLASH", "CONFIRMED", "MACD PATTERN", "OB PRESSURE", "OI SIGNAL", "FUNDING"],
         key="mode_filter"
     )
     pd_filter = col_filters[1].multiselect(
@@ -973,23 +1521,10 @@ if page == "Normal Sinyaller":
     )
     search_query = col_filters[2].text_input("Symbol Filtre", placeholder="BTC...", key="search").upper()
     macd_only = col_filters[3].checkbox("Sadece MACD Pattern'li", value=False)
+    ob_oi_only = col_filters[4].checkbox("Sadece OB/OI/Funding", value=False)
 
     st.divider()
     col_side, col_main = st.columns([1, 5])
-
-    def get_mode_css_class(mode):
-        if "CONFIRMED" in mode: return "mode-confirmed"
-        if "MACD" in mode: return "mode-macd"
-        return "mode-flash"
-
-    def label_css(s_type):
-        return {"PUMP": "pump-label", "DUMP": "dump-label", "BUY": "buy-label", "SELL": "sell-label"}.get(s_type, "buy-label")
-
-    def row_css(s_type, mode):
-        if "MACD" in mode: return "row-macd"
-        is_up = s_type in ("PUMP", "BUY")
-        if "FLASH" in mode: return "row-flash-pump" if is_up else "row-flash-dump"
-        return "row-conf-pump" if is_up else "row-conf-dump"
 
     with col_side:
         st.subheader("Top 5 Activity")
@@ -1009,6 +1544,23 @@ if page == "Normal Sinyaller":
                 </small>
             </div>""", unsafe_allow_html=True)
 
+        # YENİ: Funding Rate extremes mini widget
+        st.markdown("---")
+        st.subheader("En Negatif Funding")
+        with radar.lock:
+            funding_sorted = sorted(
+                radar.funding_state.items(),
+                key=lambda x: x[1]["rate"],
+            )[:5]
+        for sym_c, finfo in funding_sorted:
+            rate = finfo["rate"]
+            color = "#ff4b4b" if rate <= FUNDING_EXTREME_THRESHOLD else "#f1c40f"
+            st.markdown(
+                f"<span style='color:{color}; font-weight:bold;'>{sym_c}</span> "
+                f"<span style='color:#888; font-size:0.85rem;'>{rate:.4f}%</span>",
+                unsafe_allow_html=True,
+            )
+
     with col_main:
         st.subheader("Intelligence Stream")
         with radar.lock:
@@ -1023,13 +1575,15 @@ if page == "Normal Sinyaller":
             display_data = [s for s in display_data if s['P/D'] in pd_filter]
         if macd_only:
             display_data = [s for s in display_data if s.get('MACD_Pattern')]
+        if ob_oi_only:
+            display_data = [s for s in display_data if s['Mode'] in ("OB PRESSURE", "OI SIGNAL", "FUNDING")]
 
         if display_data:
             html = (
                 "<table><tr>"
                 "<th>Time</th><th>Symbol (4H ^/v)</th><th>Price</th>"
-                "<th>Momentum</th><th>15m Ref</th><th>Vol</th>"
-                "<th>Status</th><th>Type</th><th>MACD Pattern</th>"
+                "<th>Momentum</th><th>Ref</th><th>Vol</th>"
+                "<th>Status</th><th>Type</th><th>MACD Pattern</th><th>Ek Sinyal</th>"
                 "</tr>"
             )
             for row in display_data:
@@ -1041,6 +1595,7 @@ if page == "Normal Sinyaller":
                 lbl = label_css(p_type)
                 mode_cls = get_mode_css_class(mode)
                 macd_val = row.get('MACD_Pattern', '')
+                extra_tag = row.get('ExtraTag', '')
                 if macd_val:
                     pat_cls = get_macd_pattern_css_class(macd_val)
                     macd_html_str = f"<span class='macd-pattern-tag {pat_cls}'>{macd_val}</span>"
@@ -1048,6 +1603,7 @@ if page == "Normal Sinyaller":
                     macd_html_str = "-"
                 vol_display = f"{row['Vol'] / 1000:.0f}k" if row['Vol'] > 0 else "-"
                 ref_display = f"{row['Ref']:+.4f}" if row['Ref'] != 0 else "-"
+                extra_html = f"<span class='extra-tag-cell'>{extra_tag}</span>" if extra_tag else "-"
                 html += (
                     f"<tr class='{r_cls}'>"
                     f"<td>{row['Time']}</td>"
@@ -1061,6 +1617,7 @@ if page == "Normal Sinyaller":
                     f"<td><span class='{mode_cls}'>{mode}</span></td>"
                     f"<td><span class='{lbl}'>{p_type}</span></td>"
                     f"<td>{macd_html_str}</td>"
+                    f"<td>{extra_html}</td>"
                     f"</tr>"
                 )
             html += "</table>"
@@ -1156,15 +1713,216 @@ elif page == "MACD Pattern Radar":
 
 
 # ================================================================
-# SAYFA 3: SİSTEM DURUMU
+# YENİ SAYFA 3: OB / OI / FUNDING
+# ================================================================
+
+elif page == "OB / OI / Funding":
+    st.subheader("Order Book Basıncı · Open Interest · Funding Rate")
+
+    tab1, tab2, tab3 = st.tabs(["📗 Order Book Basıncı", "📊 OI Analizi", "💰 Funding Rate"])
+
+    # ---- TAB 1: ORDER BOOK ----
+    with tab1:
+        st.markdown("""
+        <div style="background-color:#0a1a2a; border-left:4px solid #2980b9; padding:10px 14px; border-radius:4px; margin-bottom:12px;">
+        <b style="color:#aed6f1;">Order Book Basıncı Nedir?</b><br>
+        <span style="color:#d5dbdb; font-size:0.85rem;">
+        Balina futures'ta pozisyon açmadan önce order book'ta büyük bid/ask duvarları oluşturur.
+        Bid tarafı ask'tan 3x+ büyükse ve fiyat henüz hareket etmemişse → öncü alım sinyali.<br>
+        Eşik: <b>OB_IMBALANCE_THRESHOLD = {}</b> | Depth: <b>{} seviye</b>
+        </span>
+        </div>
+        """.format(OB_IMBALANCE_THRESHOLD, OB_DEPTH_LIMIT), unsafe_allow_html=True)
+
+        col_ob1, col_ob2 = st.columns([3, 2])
+
+        with col_ob1:
+            st.markdown("**Son OB Sinyalleri**")
+            with radar.lock:
+                ob_log = list(radar.ob_pressure_log)
+            if ob_log:
+                html = "<table><tr><th>Zaman</th><th>Symbol</th><th>Fiyat</th><th>Yön</th><th>Oran</th><th>Açıklama</th></tr>"
+                for row in ob_log:
+                    direction = row.get("Direction", "")
+                    dir_color = "#00ff88" if direction == "BID" else "#ff4b4b"
+                    tv_url = f"https://www.tradingview.com/chart/?symbol=BINANCE:{row['Symbol']}USDT.P"
+                    html += (
+                        f"<tr class='row-ob'>"
+                        f"<td>{row['Time']}</td>"
+                        f"<td><a href='{tv_url}' target='_blank' class='sym-link'>{row['Symbol']}</a></td>"
+                        f"<td>{row['Price']}</td>"
+                        f"<td style='color:{dir_color}; font-weight:bold;'>{direction}</td>"
+                        f"<td style='font-weight:bold;'>{row['Ratio']}</td>"
+                        f"<td class='extra-tag-cell'>{row['Tag']}</td>"
+                        f"</tr>"
+                    )
+                html += "</table>"
+                st.markdown(html, unsafe_allow_html=True)
+            else:
+                st.info("OB sinyali bekleniyor — semboller taranıyor...")
+
+        with col_ob2:
+            st.markdown("**Anlık OB Durumu (Top 20 — Bid Baskısı)**")
+            with radar.lock:
+                ob_sorted = sorted(
+                    [(sym, info) for sym, info in radar.ob_state.items() if info["ratio"] >= 1.5],
+                    key=lambda x: x[1]["ratio"],
+                    reverse=True,
+                )[:20]
+            if ob_sorted:
+                for sym_c, info in ob_sorted:
+                    tv_url = f"https://www.tradingview.com/chart/?symbol=BINANCE:{sym_c}USDT.P"
+                    ratio = info["ratio"]
+                    color = "#00ff88" if ratio >= OB_IMBALANCE_THRESHOLD else "#aaa"
+                    bar_width = min(int(ratio * 15), 100)
+                    st.markdown(
+                        f"<a href='{tv_url}' target='_blank' class='sym-link'>{sym_c}</a> "
+                        f"<span style='color:{color}; font-weight:bold;'>{ratio:.2f}x</span> "
+                        f"<span style='display:inline-block; width:{bar_width}px; height:8px; "
+                        f"background:{color}; border-radius:4px; vertical-align:middle;'></span>",
+                        unsafe_allow_html=True,
+                    )
+            else:
+                st.caption("Henüz yeterli OB verisi yok...")
+
+    # ---- TAB 2: OPEN INTEREST ----
+    with tab2:
+        st.markdown("""
+        <div style="background-color:#0a2a1a; border-left:4px solid #27ae60; padding:10px 14px; border-radius:4px; margin-bottom:12px;">
+        <b style="color:#abebc6;">Open Interest Analizi Nedir?</b><br>
+        <span style="color:#d5dbdb; font-size:0.85rem;">
+        <b>🔵 Sessiz Birikim:</b> Fiyat yatay ama OI artıyor → balina pozisyon açıyor<br>
+        <b>⚠️ Sahte Pump:</b> Fiyat yukarı ama OI düşüyor → short kapanışı, gerçek alım yok<br>
+        <b>✅ Trend Teyidi:</b> Fiyat + OI birlikte artıyor → güçlü trend<br>
+        Eşikler: OI artış <b>≥{:.1f}%</b> | Fiyat düzlüğü <b>≤{:.1f}%</b>
+        </span>
+        </div>
+        """.format(OI_RISE_THRESHOLD, OI_FLAT_PRICE_MAX_CHG), unsafe_allow_html=True)
+
+        col_oi1, col_oi2 = st.columns([3, 2])
+
+        with col_oi1:
+            st.markdown("**Son OI Uyarıları**")
+            with radar.lock:
+                oi_log = list(radar.oi_divergence_log)
+            if oi_log:
+                html = "<table><tr><th>Zaman</th><th>Symbol</th><th>Fiyat</th><th>OI Δ</th><th>Fiyat Δ</th><th>Senaryo</th></tr>"
+                for row in oi_log:
+                    senaryo = row.get("Senaryo", "")
+                    if "Birikim" in senaryo: s_color = "#3498db"
+                    elif "Sahte" in senaryo: s_color = "#e74c3c"
+                    else: s_color = "#2ecc71"
+                    tv_url = f"https://www.tradingview.com/chart/?symbol=BINANCE:{row['Symbol']}USDT.P"
+                    html += (
+                        f"<tr class='row-oi'>"
+                        f"<td>{row['Time']}</td>"
+                        f"<td><a href='{tv_url}' target='_blank' class='sym-link'>{row['Symbol']}</a></td>"
+                        f"<td>{row['Price']}</td>"
+                        f"<td style='font-weight:bold;'>{row['OI_Chg']}</td>"
+                        f"<td>{row['Price_Chg']}</td>"
+                        f"<td style='color:{s_color}; font-weight:bold;'>{senaryo}</td>"
+                        f"</tr>"
+                    )
+                html += "</table>"
+                st.markdown(html, unsafe_allow_html=True)
+            else:
+                st.info("OI analizi bekleniyor — semboller taranıyor...")
+
+        with col_oi2:
+            st.markdown("**OI İzlenen Semboller**")
+            with radar.lock:
+                oi_count = len(radar.oi_state)
+            st.metric("Toplam OI Takip", oi_count)
+            st.caption(f"Fetch aralığı: {OI_FETCH_INTERVAL}s | Her cycle max 30 sembol")
+
+    # ---- TAB 3: FUNDING RATE ----
+    with tab3:
+        st.markdown("""
+        <div style="background-color:#2a2a0a; border-left:4px solid #f1c40f; padding:10px 14px; border-radius:4px; margin-bottom:12px;">
+        <b style="color:#f9e79f;">Funding Rate Anomalisi Nedir?</b><br>
+        <span style="color:#d5dbdb; font-size:0.85rem;">
+        Funding rate aşırı negatife düştüğünde short'lar çok ağır basıyor demektir.
+        Balina bu ortamda uzun pozisyon açar ve squeeze başlatır.<br>
+        <b>Squeeze eşiği: ≤{:.2f}%</b> | <b>Aşırı eşik: ≤{:.2f}%</b> | Tekrar sinyali: {}s
+        </span>
+        </div>
+        """.format(FUNDING_SQUEEZE_THRESHOLD, FUNDING_EXTREME_THRESHOLD, FUNDING_DEDUP_SECONDS), unsafe_allow_html=True)
+
+        col_f1, col_f2 = st.columns([2, 2])
+
+        with col_f1:
+            st.markdown("**Funding Anomali Sinyalleri**")
+            with radar.lock:
+                fund_log = list(radar.funding_log)
+            if fund_log:
+                html = "<table><tr><th>Zaman</th><th>Symbol</th><th>Fiyat</th><th>Funding Rate</th><th>Durum</th></tr>"
+                for row in fund_log:
+                    durum = row.get("Durum", "")
+                    d_color = "#ff4b4b" if "AŞIRI" in durum else "#f1c40f"
+                    tv_url = f"https://www.tradingview.com/chart/?symbol=BINANCE:{row['Symbol']}USDT.P"
+                    html += (
+                        f"<tr class='row-funding'>"
+                        f"<td>{row['Time']}</td>"
+                        f"<td><a href='{tv_url}' target='_blank' class='sym-link'>{row['Symbol']}</a></td>"
+                        f"<td>{row['Price']}</td>"
+                        f"<td style='color:#ff4b4b; font-weight:bold;'>{row['Rate']}</td>"
+                        f"<td style='color:{d_color}; font-weight:bold;'>{durum}</td>"
+                        f"</tr>"
+                    )
+                html += "</table>"
+                st.markdown(html, unsafe_allow_html=True)
+            else:
+                st.info("Funding anomalisi aranıyor...")
+
+        with col_f2:
+            st.markdown("**Tüm Market — En Negatif 20 Funding**")
+            with radar.lock:
+                funding_all = sorted(
+                    radar.funding_state.items(),
+                    key=lambda x: x[1]["rate"],
+                )[:20]
+            if funding_all:
+                html = "<table><tr><th>Symbol</th><th>Funding Rate</th><th>Fiyat</th></tr>"
+                for sym_c, finfo in funding_all:
+                    rate = finfo["rate"]
+                    price_f = finfo["price"]
+                    if rate <= FUNDING_EXTREME_THRESHOLD:
+                        r_color = "#ff4b4b"
+                        row_style = "row-funding"
+                    elif rate <= FUNDING_SQUEEZE_THRESHOLD:
+                        r_color = "#f1c40f"
+                        row_style = "row-funding"
+                    else:
+                        r_color = "#888"
+                        row_style = ""
+                    tv_url = f"https://www.tradingview.com/chart/?symbol=BINANCE:{sym_c}USDT.P"
+                    html += (
+                        f"<tr class='{row_style}'>"
+                        f"<td><a href='{tv_url}' target='_blank' class='sym-link'>{sym_c}</a></td>"
+                        f"<td style='color:{r_color}; font-weight:bold;'>{rate:.4f}%</td>"
+                        f"<td>{price_f:.4f if price_f < 1 else price_f:.2f}</td>"
+                        f"</tr>"
+                    )
+                html += "</table>"
+                st.markdown(html, unsafe_allow_html=True)
+            else:
+                st.info("Funding verileri yükleniyor...")
+
+    time.sleep(3)
+    st.rerun()
+
+
+# ================================================================
+# SAYFA 4: SİSTEM DURUMU
 # ================================================================
 
 elif page == "Sistem Durumu":
     st.subheader("Sistem Sağlık Paneli")
 
-    col_s1, col_s2, col_s3 = st.columns(3)
+    col_s1, col_s2, col_s3, col_s4 = st.columns(4)
 
     thread_alive = radar._worker_thread is not None and radar._worker_thread.is_alive()
+    aux_alive = radar._aux_worker_thread is not None and radar._aux_worker_thread.is_alive()
 
     with col_s1:
         st.metric("Toplam İstek", radar._total_requests)
@@ -1179,7 +1937,12 @@ elif page == "Sistem Durumu":
     with col_s3:
         st.metric("Fetch Interval", f"{radar._current_fetch_interval}s")
         st.metric("Session Yaşı", f"{time.time() - radar.session_created_at:.0f}s")
-        st.metric("Worker Thread", "✅ CANLI" if thread_alive else "⚠️ BAŞLATIYOR")
+        st.metric("Main Worker", "✅ CANLI" if thread_alive else "⚠️ BAŞLATIYOR")
+
+    with col_s4:
+        st.metric("Aux Worker (OB/OI/F)", "✅ CANLI" if aux_alive else "⚠️ BAŞLATIYOR")
+        st.metric("OB İzlenen", len(radar.ob_state))
+        st.metric("Funding İzlenen", len(radar.funding_state))
 
     st.divider()
     st.subheader("Bağlantı İstikrarı")
@@ -1192,25 +1955,49 @@ elif page == "Sistem Durumu":
     else:
         st.error(f"❌ Bağlantı kesik — {elapsed:.1f}s önce. Watchdog müdahale ediyor.")
 
+    st.divider()
+    st.subheader("OB / OI / Funding Konfigürasyonu")
+    cfg_col1, cfg_col2, cfg_col3 = st.columns(3)
+    with cfg_col1:
+        st.markdown("**Order Book**")
+        st.caption(f"Fetch aralığı: {OB_FETCH_INTERVAL}s")
+        st.caption(f"Imbalance eşiği: {OB_IMBALANCE_THRESHOLD}x")
+        st.caption(f"Depth: {OB_DEPTH_LIMIT} seviye")
+        st.caption(f"Min likidite: {OB_MIN_BID_SIZE:,} USDT")
+    with cfg_col2:
+        st.markdown("**Open Interest**")
+        st.caption(f"Fetch aralığı: {OI_FETCH_INTERVAL}s")
+        st.caption(f"OI artış eşiği: {OI_RISE_THRESHOLD}%")
+        st.caption(f"Fiyat düzlük max: {OI_FLAT_PRICE_MAX_CHG}%")
+        st.caption(f"Sahte pump fiyat eşiği: {OI_DIVERGE_CHG}%")
+    with cfg_col3:
+        st.markdown("**Funding Rate**")
+        st.caption(f"Fetch aralığı: {FUNDING_FETCH_INTERVAL}s")
+        st.caption(f"Squeeze eşiği: {FUNDING_SQUEEZE_THRESHOLD}%")
+        st.caption(f"Aşırı eşik: {FUNDING_EXTREME_THRESHOLD}%")
+        st.caption(f"Dedup: {FUNDING_DEDUP_SECONDS}s")
+
     st.info("""
-    **v4.0 SELF-HEALING Değişiklikleri (v3.0'a göre):**
+    **v4.1 Yeni Özellikler (v4.0'a ek):**
 
-    **🔴 Kök Sorun 1 — Thread ölünce dirilemediyordu:**
-    Eski: `if "thread_started" not in session_state` → sadece bir kez başlatıyordu
-    Yeni: `ensure_worker_running()` her UI refresh'te `.is_alive()` kontrol eder, ölmüşse yeniden başlatır
+    **🔵 1. Order Book Basıncı (`OB PRESSURE` modu)**
+    `/fapi/v1/depth` endpoint'i — gerçek zamanlı bid/ask imbalance.
+    Bid tarafı ask'tan 3x+ büyükse ve henüz fiyat hareket etmemişse öncü alım sinyali üretir.
+    Ayrı `_aux_worker_loop` içinde, semboller arasında dağıtılmış polling.
 
-    **🔴 Kök Sorun 2 — `time.sleep()` thread'i donduruyordu:**
-    Eski: `time.sleep(retry_after)` → circuit breaker içinde 120s donabiliyordu
-    Yeni: `_interruptible_sleep()` → 1s dilimlerinde, `stop_event` / `circuit_event` ile kesilebilir
+    **📊 2. Open Interest Analizi (`OI SIGNAL` modu)**
+    `/fapi/v1/openInterest` endpoint'i — 3 senaryo:
+    • Sessiz Birikim: Fiyat yatay + OI artıyor
+    • Sahte Pump: Fiyat yukarı + OI düşüyor (short kapanışı)
+    • Trend Teyidi: Fiyat + OI birlikte artıyor
 
-    **🔴 Kök Sorun 3 — 15m cache büyüyordu (bellek sızıntısı):**
-    Yeni: `_clean_15m_cache()` her 30 fetch'te bir 10 dakikadan eski kayıtları siler
+    **💰 3. Funding Rate Anomalisi (`FUNDING` modu)**
+    `/fapi/v1/premiumIndex` — tek istekle tüm market.
+    Aşırı negatif funding → short'lar çok ağır → squeeze ortamı → BUY sinyali.
+    Extreme (-0.10%) ve normal (-0.05%) iki seviye ayrı score ile basılır.
 
-    **🔴 Kök Sorun 4 — MACD executor zombie task biriktiriyordu:**
-    Yeni: Executor instance'a taşındı, `stop_event` kontrolü ile görevler erken çıkıyor
-
-    **🔴 Kök Sorun 5 — Worker exception'da tamamen ölüyordu:**
-    Yeni: `while not stop_event` döngüsünde her exception yakalanıyor, loop kırılmıyor
+    **Mimari değişiklik:** Yeni `_aux_worker_loop` ikinci bir thread olarak çalışır.
+    Ana loop (ticker) ile tamamen bağımsız. Watchdog her ikisini de izler.
     """)
 
     time.sleep(3)
